@@ -36,7 +36,7 @@ include_directories(
 add_library(SR_STREAMLINE_LIB SHARED
     ${PROJECT_SOURCE_DIR}/src/streamline.cpp
 )
-set_target_properties(SR_STREAMLINE_LIB PROPERTIES OUTPUT_NAME "libSuperResolutionStreamline+${LIB_PLATFORM}+${SR_BUILD_TYPE}")
+set_target_properties(SR_STREAMLINE_LIB PROPERTIES PREFIX "" OUTPUT_NAME "libSuperResolutionStreamline+${LIB_PLATFORM}+${SR_BUILD_TYPE}")
 
 target_link_libraries(SR_STREAMLINE_LIB
     SR_MAIN_LIB

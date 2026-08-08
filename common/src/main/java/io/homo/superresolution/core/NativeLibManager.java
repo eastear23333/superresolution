@@ -49,6 +49,7 @@ public class NativeLibManager {
     public static NativeLib LIB_SUPER_RESOLUTION = null;
     public static NativeLib LIB_SUPER_RESOLUTION_FSR = null;
     public static NativeLib LIB_SUPER_RESOLUTION_XESS = null;
+    public static NativeLib LIB_SUPER_RESOLUTION_NSS = null;
     public static NativeLib LIB_SUPER_RESOLUTION_NGX = null;
     public static NativeLib LIB_SUPER_RESOLUTION_STREAMLINE = null;
     public static NativeLib LIB_STREAMLINE_INTERPOSER = null;
@@ -57,6 +58,13 @@ public class NativeLibManager {
     public static NativeLib LIB_STREAMLINE_REFLEX = null;
     public static NativeLib LIB_STREAMLINE_NVNGX_REFLEX = null;
     public static NativeLib LIB_STREAMLINE_PCL = null;
+    public static NativeLib LIB_VK_LAYER_ARM_NG = null;
+    public static NativeLib LIB_VK_LAYER_ARM_NG_JSON = null;
+    public static NativeLib LIB_VK_LAYER_TENSOR = null;
+    public static NativeLib LIB_VK_LAYER_TENSOR_JSON = null;
+    public static NativeLib LIB_VK_LAYER_GRAPH = null;
+    public static NativeLib LIB_VK_LAYER_GRAPH_JSON = null;
+    public static NativeLib LIB_NGSDK_NSS = null;
     private static boolean nativeApiAvailable;
     private static boolean librariesExtracted;
     private static boolean librariesLoaded;
@@ -68,6 +76,7 @@ public class NativeLibManager {
             LIB_SUPER_RESOLUTION = new NativeLib("SuperResolution", true, true);
             LIB_SUPER_RESOLUTION_FSR = new NativeLib("SuperResolutionFSR", false, false);
             LIB_SUPER_RESOLUTION_XESS = new NativeLib("SuperResolutionXeSS", false, false);
+            LIB_SUPER_RESOLUTION_NSS = new NativeLib("SuperResolutionNSS", false, false);
             LIB_SUPER_RESOLUTION_NGX = new NativeLib("SuperResolutionNGX", false, false);
             LIB_SUPER_RESOLUTION_STREAMLINE = new NativeLib("SuperResolutionStreamline", presentation, presentation);
             LIB_STREAMLINE_COMMON = new NativeLib("sl.common", presentation, presentation, true);
@@ -76,9 +85,17 @@ public class NativeLibManager {
             LIB_STREAMLINE_REFLEX = new NativeLib("sl.reflex", false, presentation, true);
             LIB_STREAMLINE_PCL = new NativeLib("sl.pcl", false, presentation, true);
             LIB_STREAMLINE_NVNGX_REFLEX = new NativeLib("NvLowLatencyVk", false, presentation, true);
+            LIB_VK_LAYER_ARM_NG = new NativeLib("VkLayer_arm_NG.dll", false, false, true);
+            LIB_VK_LAYER_ARM_NG_JSON = new NativeLib("VkLayer_arm_NG.json", false, false, true);
+            LIB_VK_LAYER_TENSOR = new NativeLib("VkLayer_Tensor.dll", false, false, true);
+            LIB_VK_LAYER_TENSOR_JSON = new NativeLib("VkLayer_Tensor.json", false, false, true);
+            LIB_VK_LAYER_GRAPH = new NativeLib("VkLayer_Graph.dll", false, false, true);
+            LIB_VK_LAYER_GRAPH_JSON = new NativeLib("VkLayer_Graph.json", false, false, true);
+            LIB_NGSDK_NSS = new NativeLib("ngsdk_windows_x64.dll", false, false, true);
             libs.add(LIB_SUPER_RESOLUTION);
             libs.add(LIB_SUPER_RESOLUTION_FSR);
             libs.add(LIB_SUPER_RESOLUTION_XESS);
+            libs.add(LIB_SUPER_RESOLUTION_NSS);
             libs.add(LIB_SUPER_RESOLUTION_NGX);
             libs.add(LIB_STREAMLINE_COMMON);
             libs.add(LIB_STREAMLINE_INTERPOSER);
@@ -87,6 +104,13 @@ public class NativeLibManager {
             libs.add(LIB_STREAMLINE_REFLEX);
             libs.add(LIB_STREAMLINE_PCL);
             libs.add(LIB_STREAMLINE_NVNGX_REFLEX);
+            libs.add(LIB_VK_LAYER_ARM_NG);
+            libs.add(LIB_VK_LAYER_ARM_NG_JSON);
+            libs.add(LIB_VK_LAYER_TENSOR);
+            libs.add(LIB_VK_LAYER_TENSOR_JSON);
+            libs.add(LIB_VK_LAYER_GRAPH);
+            libs.add(LIB_VK_LAYER_GRAPH_JSON);
+            libs.add(LIB_NGSDK_NSS);
         } else if (operatingSystem.type == OperatingSystemType.ANDROID && operatingSystem.arch == SystemArchitecture.AARCH64) {
             LIB_SUPER_RESOLUTION = new NativeLib("SuperResolution", true, true);
             libs.add(LIB_SUPER_RESOLUTION);
@@ -94,9 +118,11 @@ public class NativeLibManager {
         } else if (operatingSystem.type == OperatingSystemType.LINUX && operatingSystem.arch == SystemArchitecture.X86_64) {
             LIB_SUPER_RESOLUTION = new NativeLib("SuperResolution", true, true);
             LIB_SUPER_RESOLUTION_FSR = new NativeLib("SuperResolutionFSR", false, false);
+            LIB_SUPER_RESOLUTION_NSS = new NativeLib("SuperResolutionNSS", false, false);
             LIB_SUPER_RESOLUTION_NGX = new NativeLib("SuperResolutionNGX", true, false);
             libs.add(LIB_SUPER_RESOLUTION);
             libs.add(LIB_SUPER_RESOLUTION_FSR);
+            libs.add(LIB_SUPER_RESOLUTION_NSS);
             libs.add(LIB_SUPER_RESOLUTION_NGX);
 
         } else if (operatingSystem.type == OperatingSystemType.MACOS && operatingSystem.arch == SystemArchitecture.AARCH64) {
@@ -282,6 +308,11 @@ public class NativeLibManager {
         }
 
         private static String buildFullFileName(String baseName, boolean nameIsPath) {
+            // 如果 baseName 已包含扩展名（如 VkLayer_arm_NG.json），直接返回
+            if (nameIsPath && (baseName.endsWith(".dll") || baseName.endsWith(".json")
+                    || baseName.endsWith(".so") || baseName.endsWith(".dylib"))) {
+                return baseName;
+            }
             OperatingSystem operatingSystem = new OperatingSystem();
             StringBuilder sb = new StringBuilder();
             if (!nameIsPath) {

@@ -3,6 +3,7 @@ project(SuperResolution)
 
 option(SR_FSR "启用以支持FSR" ON)
 option(SR_XESS "启用以支持XESS" ON)
+option(SR_NSS "启用以支持Arm NSS" ON)
 option(SR_NGX "启用以支持NGX绑定" ON)
 option(SR_STREAMLINE "启用以支持Streamline" ON)
 
@@ -82,6 +83,10 @@ if(SR_FSR)
 endif()
 if(SR_XESS)
     add_subdirectory("SRNativeXeSS")
+endif()
+
+if(SR_NSS AND ON_WINDOWS)
+    add_subdirectory("SRNativeNSS")
 endif()
 
 if(SR_NGX)

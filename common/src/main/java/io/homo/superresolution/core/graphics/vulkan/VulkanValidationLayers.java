@@ -38,7 +38,7 @@ import static org.lwjgl.vulkan.VK10.*;
 
 public class VulkanValidationLayers implements Destroyable {
     private static final Logger LOGGER = LoggerFactory.getLogger(VulkanValidationLayers.class);
-    private static final Set<String> REQUIRED_LAYERS = Collections.singleton("VK_LAYER_KHRONOS_validation");
+    static final Set<String> REQUIRED_LAYERS = Collections.singleton("VK_LAYER_KHRONOS_validation");
 
     private final VkInstance instance;
     private long debugMessenger;

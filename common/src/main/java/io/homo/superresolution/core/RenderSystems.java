@@ -48,6 +48,7 @@ import static org.lwjgl.vulkan.KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSIO
 import static org.lwjgl.vulkan.KHRShaderFloat16Int8.VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRShaderIntegerDotProduct.VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRDynamicRendering.VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
+import static org.lwjgl.vulkan.KHRSynchronization2.VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
 
 public class RenderSystems {
     private static VkRenderSystem vulkan;
@@ -147,7 +148,8 @@ public class RenderSystems {
                 .addDeviceExtension("VK_NVX_image_view_handle")
                 .addDeviceExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
                 .addDeviceExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)
-                .addDeviceExtension(VK_EXT_PRIVATE_DATA_EXTENSION_NAME);
+                .addDeviceExtension(VK_EXT_PRIVATE_DATA_EXTENSION_NAME)
+                .addDeviceExtension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);//NSS ML 模拟层硬性要求
         if (Platform.currentPlatform.getOS().type == OperatingSystemType.WINDOWS) {
             vulkan.addDeviceExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME)
                     .addDeviceExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);

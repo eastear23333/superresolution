@@ -35,6 +35,7 @@ import io.homo.superresolution.common.upscale.dlss.DLSS;
 import io.homo.superresolution.common.upscale.ffxfsr.FfxFSR;
 import io.homo.superresolution.common.upscale.fsr1.FSR1;
 import io.homo.superresolution.common.upscale.fsr2.FSR2;
+import io.homo.superresolution.common.upscale.nss.NSS;
 import io.homo.superresolution.common.upscale.none.None;
 import io.homo.superresolution.common.upscale.sgsr.v1.Sgsr1;
 import io.homo.superresolution.common.upscale.sgsr.v2.Sgsr2;
@@ -118,6 +119,28 @@ public class AlgorithmDescriptions {
                     .setName(Component.translatable("superresolution.algo.preset.dlss.dlaa"))
                     .setCodeName("dlss_dlaa")
                     .setUpscaleRatio(1.0f)
+    );
+    private static final List<QualityPreset> NSS_QUALITY_PRESETS = List.of(
+            new QualityPreset()
+                    .setName(Component.translatable("superresolution.algo.preset.nss.native_aa"))
+                    .setCodeName("nss_native_aa")
+                    .setUpscaleRatio(1.0f),
+            new QualityPreset()
+                    .setName(Component.translatable("superresolution.algo.preset.nss.quality"))
+                    .setCodeName("nss_quality")
+                    .setUpscaleRatio(1.5f),
+            new QualityPreset()
+                    .setName(Component.translatable("superresolution.algo.preset.nss.balanced"))
+                    .setCodeName("nss_balanced")
+                    .setUpscaleRatio(2.0f),
+            new QualityPreset()
+                    .setName(Component.translatable("superresolution.algo.preset.nss.performance"))
+                    .setCodeName("nss_performance")
+                    .setUpscaleRatio(2.5f),
+            new QualityPreset()
+                    .setName(Component.translatable("superresolution.algo.preset.nss.ultra_performance"))
+                    .setCodeName("nss_ultra_performance")
+                    .setUpscaleRatio(3.0f)
     );
     private static final List<QualityPreset> ANIME4K_QUALITY_PRESETS = List.of(
             new QualityPreset()
@@ -241,6 +264,79 @@ public class AlgorithmDescriptions {
             .customUpscaleRatio(false)
             .build();
 
+    public static final AlgorithmDescription<NSS> NSS = AlgorithmDescription.builder(NSS.class)
+            .briefName("Arm NSS")
+            .codeName("nss")
+            .displayName("Arm Neural Super Sampling")
+            .requirement(
+                    Requirement.nothing()
+                            .addSupportedOS(new OperatingSystem(SystemArchitecture.X86_64, OperatingSystemType.WINDOWS))
+                            .addSupportedOS(new OperatingSystem(SystemArchitecture.X86_64, OperatingSystemType.LINUX))
+                            .requiredGlExtension("GL_EXT_memory_object")
+                            .requiredGlExtension("GL_EXT_semaphore")
+                            .glMajorVersion(4)
+                            .glMinorVersion(6)
+                            .requireVulkan(true)
+                            .requireVulkanDeviceExtension("VK_KHR_synchronization2")
+            )
+            .extraResources(
+                    ExtraResources.builder()
+                            .add(ExtraResource.builder("ngsdk_windows_x64.dll")
+                                    .addRemote(
+                                            "https://cnb.cool/187J3X1-114514/mc-superresolution/-/releases/download/assets/ngsdk_windows_x64.dll",
+                                            "CNB Mirror"
+                                    )
+                                    .build()
+                            )
+                            .add(ExtraResource.builder("VkLayer_arm_NG.dll")
+                                    .addRemote(
+                                            "https://cnb.cool/187J3X1-114514/mc-superresolution/-/releases/download/assets/VkLayer_arm_NG.dll",
+                                            "CNB Mirror"
+                                    )
+                                    .build()
+                            )
+                            .add(ExtraResource.builder("VkLayer_arm_NG.json")
+                                    .addRemote(
+                                            "https://cnb.cool/187J3X1-114514/mc-superresolution/-/releases/download/assets/VkLayer_arm_NG.json",
+                                            "CNB Mirror"
+                                    )
+                                    .build()
+                            )
+                            .add(ExtraResource.builder("VkLayer_Tensor.dll")
+                                    .addRemote(
+                                            "https://cnb.cool/187J3X1-114514/mc-superresolution/-/releases/download/assets/VkLayer_Tensor.dll",
+                                            "CNB Mirror"
+                                    )
+                                    .build()
+                            )
+                            .add(ExtraResource.builder("VkLayer_Tensor.json")
+                                    .addRemote(
+                                            "https://cnb.cool/187J3X1-114514/mc-superresolution/-/releases/download/assets/VkLayer_Tensor.json",
+                                            "CNB Mirror"
+                                    )
+                                    .build()
+                            )
+                            .add(ExtraResource.builder("VkLayer_Graph.dll")
+                                    .addRemote(
+                                            "https://cnb.cool/187J3X1-114514/mc-superresolution/-/releases/download/assets/VkLayer_Graph.dll",
+                                            "CNB Mirror"
+                                    )
+                                    .build()
+                            )
+                            .add(ExtraResource.builder("VkLayer_Graph.json")
+                                    .addRemote(
+                                            "https://cnb.cool/187J3X1-114514/mc-superresolution/-/releases/download/assets/VkLayer_Graph.json",
+                                            "CNB Mirror"
+                                    )
+                                    .build()
+                            )
+                            .build()
+            )
+            .supportJitter(true)
+            .qualityPresets(NSS_QUALITY_PRESETS)
+            .customUpscaleRatio(true)
+            .build();
+
     public static final AlgorithmDescription<Sgsr1> SGSR1 = AlgorithmDescription.builder(Sgsr1.class)
             .briefName("SGSR V1")
             .codeName("sgsr1")
@@ -287,6 +383,7 @@ public class AlgorithmDescriptions {
         AlgorithmRegistry.registry(FSR);
         AlgorithmRegistry.registry(XESS);
         AlgorithmRegistry.registry(DLSS);
+        AlgorithmRegistry.registry(NSS);
         AlgorithmRegistry.registry(SGSR1);
         AlgorithmRegistry.registry(SGSR2);
         if (Platform.currentPlatform.isDevelopmentEnvironment()) {
