@@ -996,26 +996,55 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
             addLabeledOptionGroup(
                 container,
                 Text.translatable("superresolution.screen.config.category.presentation"),
-                builder -> builder.booleanOption(
-                                Text.translatable("superresolution.screen.config.options.label.enable_vulkan_presentation"),
-                                SuperResolutionConfig.isEnableVulkanPresentation())
-                        .setDefaultValue(() -> false)
-                        .setRequireRestartGame(true)
-                        .setDescription(Text.translatable(
-                                "superresolution.screen.config.options.tooltip.enable_vulkan_presentation"
-                        ))
-                        .setEnableRequirement(OptionRequirement.all(
-                                () -> !SuperResolutionConfig.isSkipInitVulkan()
-                        ))
-                        .setTooltipSupplier(value -> Optional.of(Tooltip.withContext(
-                                Text.translatable(
-                                        SuperResolutionConfig.isSkipInitVulkan()
-                                                ? "superresolution.screen.config.options.tooltip.enable_vulkan_presentation.vulkan_disabled"
-                                                : "superresolution.screen.config.options.tooltip.enable_vulkan_presentation"
-                                ).getString()
-                        )))
-                        .setSaveConsumer(SuperResolutionConfig::setEnableVulkanPresentation)
-                        .build()
+                builder -> {
+                    builder.booleanOption(
+                                    Text.translatable("superresolution.screen.config.options.label.enable_vulkan_presentation"),
+                                    SuperResolutionConfig.isEnableVulkanPresentation())
+                            .setDefaultValue(() -> false)
+                            .setRequireRestartGame(true)
+                            .setDescription(Text.translatable(
+                                    "superresolution.screen.config.options.tooltip.enable_vulkan_presentation"
+                            ))
+                            .setEnableRequirement(OptionRequirement.all(
+                                    () -> !SuperResolutionConfig.isSkipInitVulkan(),
+                                    () -> !SuperResolutionConfig.isEnableD3D12Presentation()
+                            ))
+                            .setTooltipSupplier(value -> Optional.of(Tooltip.withContext(
+                                    Text.translatable(
+                                            SuperResolutionConfig.isSkipInitVulkan()
+                                                    ? "superresolution.screen.config.options.tooltip.enable_vulkan_presentation.vulkan_disabled"
+                                                    : SuperResolutionConfig.isEnableD3D12Presentation()
+                                                            ? "superresolution.screen.config.options.tooltip.enable_d3d12_presentation.mutually_exclusive"
+                                                            : "superresolution.screen.config.options.tooltip.enable_vulkan_presentation"
+                                    ).getString()
+                            )))
+                            .setSaveConsumer(SuperResolutionConfig::setEnableVulkanPresentation)
+                            .build();
+
+                    builder.booleanOption(
+                                    Text.translatable("superresolution.screen.config.options.label.enable_d3d12_presentation"),
+                                    SuperResolutionConfig.isEnableD3D12Presentation())
+                            .setDefaultValue(() -> false)
+                            .setRequireRestartGame(true)
+                            .setDescription(Text.translatable(
+                                    "superresolution.screen.config.options.tooltip.enable_d3d12_presentation"
+                            ))
+                            .setEnableRequirement(OptionRequirement.all(
+                                    () -> !SuperResolutionConfig.isSkipInitVulkan(),
+                                    () -> !SuperResolutionConfig.isEnableVulkanPresentation()
+                            ))
+                            .setTooltipSupplier(value -> Optional.of(Tooltip.withContext(
+                                    Text.translatable(
+                                            SuperResolutionConfig.isSkipInitVulkan()
+                                                    ? "superresolution.screen.config.options.tooltip.enable_vulkan_presentation.vulkan_disabled"
+                                                    : SuperResolutionConfig.isEnableVulkanPresentation()
+                                                            ? "superresolution.screen.config.options.tooltip.enable_d3d12_presentation.mutually_exclusive"
+                                                            : "superresolution.screen.config.options.tooltip.enable_d3d12_presentation"
+                                    ).getString()
+                            )))
+                            .setSaveConsumer(SuperResolutionConfig::setEnableD3D12Presentation)
+                            .build();
+                }
         );
 
 

@@ -69,6 +69,7 @@ public class SuperResolutionConfig {
     public static final SpecialConfigs SPECIAL;
     public static final BooleanValue ENABLE_UPSCALE;
     public static final BooleanValue ENABLE_VULKAN_PRESENTATION;
+    public static final BooleanValue ENABLE_D3D12_PRESENTATION;
     public static final FloatValue UPSCALE_RATIO;
     public static final StringValue UPSCALE_ALGO;
     public static final FloatValue SHARPNESS;
@@ -123,8 +124,15 @@ public class SuperResolutionConfig {
                 () -> false,
                 "Present Minecraft through a Vulkan swapchain. Requires a game restart."
         );
+        ENABLE_D3D12_PRESENTATION = builder.defineBoolean(
+                "enable_d3d12_presentation",
+                () -> false,
+                "Present Minecraft through a Direct3D 12 swapchain (XeSS-FG / XeLL / FSR 4.1). "
+                        + "Mutually exclusive with Vulkan presentation. Requires a game restart."
+        );
         #else
         ENABLE_VULKAN_PRESENTATION = null;
+        ENABLE_D3D12_PRESENTATION = null;
         #endif
         UPSCALE_RATIO = builder.defineFloat(
                 "upscale_ratio",
@@ -628,7 +636,27 @@ public class SuperResolutionConfig {
 
     public static void setEnableVulkanPresentation(boolean value) {
         #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
+        if (value) {
+            setEnableD3D12Presentation(false);
+        }
         ENABLE_VULKAN_PRESENTATION.set(value);
+        #endif
+    }
+
+    public static boolean isEnableD3D12Presentation() {
+        #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
+        return ENABLE_D3D12_PRESENTATION.get();
+        #else
+        return false;
+        #endif
+    }
+
+    public static void setEnableD3D12Presentation(boolean value) {
+        #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
+        if (value) {
+            setEnableVulkanPresentation(false);
+        }
+        ENABLE_D3D12_PRESENTATION.set(value);
         #endif
     }
 
