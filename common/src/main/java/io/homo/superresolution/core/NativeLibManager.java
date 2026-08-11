@@ -214,6 +214,14 @@ public class NativeLibManager {
 
             File f = lib.getTargetPath(path).toFile();
             if (lib.loadAtStartup) {
+                // "跳过 D3D12 初始化"开启时不加载 D3D12 互操作库,
+                // 使 d3d12InteropAvailable() 返回 false,禁用 FSR4.1 / XeSS (D3D12)。
+                if (lib == LIB_SUPER_RESOLUTION_D3D12_INTEROP
+                        && SuperResolutionConfig.isSkipInitD3D12()) {
+                    LOGGER.info("跳过 D3D12 初始化,不加载 {}", f.getAbsolutePath());
+                    lib.available = false;
+                    continue;
+                }
                 try {
                     LOGGER.info("加载依赖库： {}", f.getAbsolutePath());
                     System.load(f.getAbsolutePath());

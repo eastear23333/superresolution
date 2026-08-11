@@ -2,6 +2,8 @@
 #include "sr/fsr/fsr3.h"
 #include "FidelityFX/host/backends/vk/ffx_vk.h"
 #include "FidelityFX/host/ffx_fsr3.h"
+#include <windows.h>
+#include <cwchar>
 #include <cstring>
 #include <cstdlib>
 #include <utility>
@@ -13,6 +15,24 @@ struct SRFsr3PrivateData {
     void *scratchBuffer;
     uint64_t frameIndex;
 };
+
+// FSR3 运行时检查 cameraNear < 0.075 并打 WARNING(每帧 dispatch 触发)。
+// Minecraft near 平面取 0.05,必然命中。降级为 DEBUG(仅调试器输出)且只打一次。
+static bool g_fsr3CameraNearWarned = false;
+
+static void srFfxFsr3MessageFilter(FfxMsgType type, const wchar_t *message) {
+    if (message && wcsstr(message, L"cameraNear value is very low") != nullptr) {
+        if (!g_fsr3CameraNearWarned) {
+            g_fsr3CameraNearWarned = true;
+            OutputDebugStringW(L"[FSR3][DEBUG] ");
+            OutputDebugStringW(message);
+            OutputDebugStringW(L"\n");
+        }
+        return;
+    }
+    OutputDebugStringW(message);
+    OutputDebugStringW(L"\n");
+}
 #ifdef __cplusplus
 extern "C" {
     #endif
@@ -44,9 +64,7 @@ extern "C" {
         fsrContexDesc.maxUpscaleSize = {desc->upscaledSize.x, desc->upscaledSize.y};
         fsrContexDesc.displaySize = {desc->upscaledSize.x, desc->upscaledSize.y};
         fsrContexDesc.backBufferFormat = FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT;
-        fsrContexDesc.fpMessage = desc->messageCallback
-                                      ? reinterpret_cast<FfxFsr3UpscalerMessage>(desc->messageCallback)
-                                      : nullptr;
+        fsrContexDesc.fpMessage = srFfxFsr3MessageFilter;
 
         FfxErrorCode code = ffxFsr3ContextCreate(privateData->context, &fsrContexDesc);
         if (code != FFX_OK) {

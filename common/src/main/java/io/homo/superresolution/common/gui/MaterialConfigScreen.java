@@ -576,6 +576,12 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                 algorithmDescription.equals(AlgorithmDescriptions.ANIME4K);
     }
 
+    /** 运行在 D3D12 后端(通过 GL↔D3D12 互操作)的算法,依赖 D3D12 初始化。 */
+    private boolean isD3D12Algorithm(AlgorithmDescription<?> algorithmDescription) {
+        return algorithmDescription.equals(AlgorithmDescriptions.FSR4_D3D12) ||
+                algorithmDescription.equals(AlgorithmDescriptions.XESS_D3D12);
+    }
+
     /**
      * The selectable low latency entries: the "none" sentinel plus every group that at least
      * one registered backend belongs to. Concrete backends are never listed; the negotiator
@@ -886,6 +892,12 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                             if (!result.additionalConditionsMet()){
                                 sb.append("\n");
                                 sb.append(Text.translatable("superresolution.screen.config.options.tooltip.algo.reason.other").getString());
+                                // D3D12 系算法:跳过 D3D12 初始化时提示原因
+                                if (SuperResolutionConfig.isSkipInitD3D12()
+                                        && isD3D12Algorithm(algorithmDescription)) {
+                                    sb.append("\n");
+                                    sb.append(Text.translatable("superresolution.screen.config.options.tooltip.algo.reason.d3d12_skip_init_hint").getString());
+                                }
                             }
                         }
                         return Optional.of(Tooltip.withContext(sb.toString()));
@@ -1373,6 +1385,15 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                             .setDescription(Text.translatable("superresolution.screen.config.options.tooltip.skip_init_vulkan"))
                             .setDefaultValue(() -> false)
                             .setSaveConsumer(SuperResolutionConfig::setSkipInitVulkan)
+                            .build();
+
+                    builder.booleanOption(
+                                    Text.translatable("superresolution.screen.config.options.label.skip_init_d3d12"),
+                                    SuperResolutionConfig.isSkipInitD3D12())
+                            .setDescription(Text.translatable("superresolution.screen.config.options.tooltip.skip_init_d3d12"))
+                            .setDefaultValue(() -> true)
+                            .setRequireRestartGame(true)
+                            .setSaveConsumer(SuperResolutionConfig::setSkipInitD3D12)
                             .build();
 
                     builder.booleanOption(

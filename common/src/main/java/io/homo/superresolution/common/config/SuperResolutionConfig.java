@@ -78,6 +78,7 @@ public class SuperResolutionConfig {
     public static final EnumValue<CaptureMode> CAPTURE_MODE;
     public static final BooleanValue DEBUG_DUMP_SHADER;
     public static final BooleanValue SKIP_INIT_VULKAN;
+    public static final BooleanValue SKIP_INIT_D3D12;
     public static final BooleanValue ENABLE_RENDER_DOC;
     public static final BooleanValue ENABLE_IMGUI;
     public static final BooleanValue ENABLE_PRESENT_INDICATOR;
@@ -109,6 +110,10 @@ public class SuperResolutionConfig {
     public static final Runnable resolutionChangeCallback;
     private static volatile boolean unstableIncompatibleShaderSupportStartup;
     private static volatile boolean startupOptionsFrozen;
+    // 回退警告只打一次,避免渲染线程每帧刷屏;状态变化后重置再警告。
+    private static volatile boolean fallbackSupportWarned;
+    private static volatile boolean fallbackDisabledWarned;
+    private static volatile boolean fallbackNoneWarned;
 
     static {
         ModConfigSpecBuilder builder = new ModConfigSpecBuilder();
@@ -233,6 +238,13 @@ public class SuperResolutionConfig {
                 "debug/skip_init_vulkan",
                 () -> !(CURRENT_OS_TYPE == OperatingSystemType.ANDROID || CURRENT_OS_TYPE == OperatingSystemType.MACOS),
                 "Skip Vulkan initialization (auto-set based on OS)"
+        );
+
+        SKIP_INIT_D3D12 = builder.defineBoolean(
+                "debug/skip_init_d3d12",
+                () -> true,
+                "Skip Direct3D 12 initialization. When enabled, D3D12-based algorithms "
+                        + "(AMD FSR 4.1, Intel XeSS (D3D12)) are disabled."
         );
 
         ENABLE_RENDER_DOC = builder.defineBoolean(
@@ -459,24 +471,36 @@ public class SuperResolutionConfig {
         }
 
         if (!algo.requirement.check().support() && !Platform.currentPlatform.isDevelopmentEnvironment()) {
-            SuperResolution.LOGGER.warn("算法 {} 不支持，回退到默认算法", algo.displayName);
+            if (!fallbackSupportWarned) {
+                SuperResolution.LOGGER.warn("算法 {} 不支持，回退到默认算法", algo.displayName);
+                fallbackSupportWarned = true;
+            }
             AlgorithmDescription<?> defaultAlgo = getDefaultAlgorithm();
             UPSCALE_ALGO.set(defaultAlgo.codeName);
             return defaultAlgo;
         }
+        fallbackSupportWarned = false;
 
         // 光影包禁用的算法只在运行期回退，不写回配置——卸载光影包后恢复用户原选择
         if (SRWorkModeManager.getCurrentState().disabledAlgorithms().contains(algo.codeName)) {
-            SuperResolution.LOGGER.warn("算法 {} 已被当前光影包禁用，回退到默认算法", algo.displayName);
+            if (!fallbackDisabledWarned) {
+                SuperResolution.LOGGER.warn("算法 {} 已被当前光影包禁用，回退到默认算法", algo.displayName);
+                fallbackDisabledWarned = true;
+            }
             return getDefaultAlgorithm();
         }
+        fallbackDisabledWarned = false;
 
         // None（仅帧生成模式）仅在光影包声明支持时可用；不写回配置，切换光影后自动恢复
         if (AlgorithmDescriptions.NONE.equals(algo)
                 && !SRWorkModeManager.getCurrentState().supportsFrameGeneration()) {
-            SuperResolution.LOGGER.warn("当前光影包不支持仅帧生成模式，None 算法不可用，回退到默认算法");
+            if (!fallbackNoneWarned) {
+                SuperResolution.LOGGER.warn("当前光影包不支持仅帧生成模式，None 算法不可用，回退到默认算法");
+                fallbackNoneWarned = true;
+            }
             return getDefaultAlgorithm();
         }
+        fallbackNoneWarned = false;
 
         return algo;
     }
@@ -609,6 +633,14 @@ public class SuperResolutionConfig {
 
     public static void setSkipInitVulkan(boolean value) {
         SKIP_INIT_VULKAN.set(value);
+    }
+
+    public static boolean isSkipInitD3D12() {
+        return SKIP_INIT_D3D12.get();
+    }
+
+    public static void setSkipInitD3D12(boolean value) {
+        SKIP_INIT_D3D12.set(value);
     }
 
     public static boolean isEnableRenderDoc() {

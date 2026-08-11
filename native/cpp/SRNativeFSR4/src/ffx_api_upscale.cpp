@@ -34,6 +34,25 @@ namespace {
         ffxCreateContextDescUpscaleVersion versionDesc = {};
     };
 
+    // FFX 运行时会检查 cameraNear < 0.075 并打 WARNING(每帧 dispatch 都会触发)。
+    // Minecraft 的 near 平面取 0.05,必然命中。这里把这条警告降级为 DEBUG(仅调试器
+    // 输出)且只打印一次,避免刷屏;其余消息按原样透传。
+    static bool g_cameraNearWarned = false;
+
+    static void srFfxApiMessageFilter(uint32_t type, const wchar_t *message) {
+        if (message && wcsstr(message, L"cameraNear value is very low") != nullptr) {
+            if (!g_cameraNearWarned) {
+                g_cameraNearWarned = true;
+                OutputDebugStringW(L"[FSR4][DEBUG] ");
+                OutputDebugStringW(message);
+                OutputDebugStringW(L"\n");
+            }
+            return;
+        }
+        OutputDebugStringW(message);
+        OutputDebugStringW(L"\n");
+    }
+
     std::wstring utf8ToWide(const char *value) {
         if (!value || !*value) {
             return {};
@@ -206,7 +225,7 @@ extern "C" {
         privateData->createDesc.flags = toFfxCreateFlags(desc->flags);
         privateData->createDesc.maxRenderSize = {desc->renderSize.x, desc->renderSize.y};
         privateData->createDesc.maxUpscaleSize = {desc->upscaledSize.x, desc->upscaledSize.y};
-        privateData->createDesc.fpMessage = reinterpret_cast<ffxApiMessage>(desc->messageCallback);
+        privateData->createDesc.fpMessage = srFfxApiMessageFilter;
 
         privateData->backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
         privateData->backendDesc.header.pNext = &privateData->versionDesc.header;
