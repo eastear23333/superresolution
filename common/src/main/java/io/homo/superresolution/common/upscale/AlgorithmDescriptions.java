@@ -40,6 +40,7 @@ import io.homo.superresolution.common.upscale.none.None;
 import io.homo.superresolution.common.upscale.sgsr.v1.Sgsr1;
 import io.homo.superresolution.common.upscale.sgsr.v2.Sgsr2;
 import io.homo.superresolution.common.upscale.xess.XeSS;
+import io.homo.superresolution.common.upscale.xess.XeSSD3D12;
 import io.homo.superresolution.core.NativeLibManager;
 import io.homo.superresolution.core.graphics.opengl.Gl;
 import net.minecraft.network.chat.Component;
@@ -245,6 +246,40 @@ public class AlgorithmDescriptions {
             .customUpscaleRatio(false)
             .build();
 
+    public static final AlgorithmDescription<XeSSD3D12> XESS_D3D12 =
+            AlgorithmDescription.builder(XeSSD3D12.class)
+                    .briefName("Intel XeSS (D3D12)")
+                    .codeName("xess_d3d12")
+                    .displayName("Intel XeSS (Direct3D 12)")
+                    .requirement(
+                            Requirement.nothing()
+                                    .addSupportedOS(new OperatingSystem(
+                                            SystemArchitecture.X86_64,
+                                            OperatingSystemType.WINDOWS))
+                                    .requiredGlExtension("GL_EXT_memory_object")
+                                    .requiredGlExtension("GL_EXT_memory_object_win32")
+                                    .requiredGlExtension("GL_EXT_semaphore")
+                                    .requiredGlExtension("GL_EXT_semaphore_win32")
+                                    .glMajorVersion(4)
+                                    .glMinorVersion(6)
+                                    .isTrue(NativeLibManager::d3d12InteropAvailable)
+                    )
+                    .extraResources(
+                            ExtraResources.builder()
+                                    .add(ExtraResource.builder("libxess.dll")
+                                            .addRemote(
+                                                    "https://cnb.cool/187J3X1-114514/mc-superresolution/-/releases/download/assets/libxess.dll",
+                                                    "CNB Mirror"
+                                            )
+                                            .build()
+                                    )
+                                    .build()
+                    )
+                    .supportJitter(true)
+                    .qualityPresets(XESS_QUALITY_PRESETS)
+                    .customUpscaleRatio(false)
+                    .build();
+
     public static final AlgorithmDescription<DLSS> DLSS = AlgorithmDescription.builder(DLSS.class)
             .briefName("NVIDIA DLSS")
             .codeName("dlss")
@@ -323,6 +358,7 @@ public class AlgorithmDescriptions {
         AlgorithmRegistry.registry(FSR);
         AlgorithmRegistry.registry(FSR4_D3D12);
         AlgorithmRegistry.registry(XESS);
+        AlgorithmRegistry.registry(XESS_D3D12);
         AlgorithmRegistry.registry(DLSS);
         AlgorithmRegistry.registry(SGSR1);
         AlgorithmRegistry.registry(SGSR2);

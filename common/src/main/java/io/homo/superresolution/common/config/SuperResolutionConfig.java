@@ -36,6 +36,7 @@ import io.homo.superresolution.common.SuperResolution;
 import io.homo.superresolution.common.config.enums.CaptureMode;
 import io.homo.superresolution.common.config.enums.InternalTextureFormat;
 import io.homo.superresolution.common.config.enums.InteropSyncMode;
+import io.homo.superresolution.common.config.enums.PresentationMode;
 import io.homo.superresolution.common.config.special.SpecialConfigs;
 import io.homo.superresolution.api.registry.FrameGenerationGroups;
 import io.homo.superresolution.common.framegeneration.FrameGenerationMode;
@@ -70,6 +71,7 @@ public class SuperResolutionConfig {
     public static final BooleanValue ENABLE_UPSCALE;
     public static final BooleanValue ENABLE_VULKAN_PRESENTATION;
     public static final BooleanValue ENABLE_D3D12_PRESENTATION;
+    public static final EnumValue<PresentationMode> PRESENTATION_MODE;
     public static final FloatValue UPSCALE_RATIO;
     public static final StringValue UPSCALE_ALGO;
     public static final FloatValue SHARPNESS;
@@ -127,12 +129,19 @@ public class SuperResolutionConfig {
         ENABLE_D3D12_PRESENTATION = builder.defineBoolean(
                 "enable_d3d12_presentation",
                 () -> false,
-                "Present Minecraft through a Direct3D 12 swapchain (XeSS-FG / XeLL / FSR 4.1). "
+                "Present Minecraft through a Direct3D 12 swapchain. "
                         + "Mutually exclusive with Vulkan presentation. Requires a game restart."
+        );
+        PRESENTATION_MODE = builder.defineEnum(
+                "presentation_mode",
+                PresentationMode.class,
+                () -> PresentationMode.OPENGL,
+                "Graphics API used to present the final frame: OpenGL / Vulkan / Direct3D 12"
         );
         #else
         ENABLE_VULKAN_PRESENTATION = null;
         ENABLE_D3D12_PRESENTATION = null;
+        PRESENTATION_MODE = null;
         #endif
         UPSCALE_RATIO = builder.defineFloat(
                 "upscale_ratio",
@@ -628,7 +637,7 @@ public class SuperResolutionConfig {
 
     public static boolean isEnableVulkanPresentation() {
         #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
-        return ENABLE_VULKAN_PRESENTATION.get();
+        return getPresentationMode() == PresentationMode.VULKAN;
         #else
         return false;
         #endif
@@ -637,15 +646,16 @@ public class SuperResolutionConfig {
     public static void setEnableVulkanPresentation(boolean value) {
         #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
         if (value) {
-            setEnableD3D12Presentation(false);
+            setPresentationMode(PresentationMode.VULKAN);
+        } else if (getPresentationMode() == PresentationMode.VULKAN) {
+            setPresentationMode(PresentationMode.OPENGL);
         }
-        ENABLE_VULKAN_PRESENTATION.set(value);
         #endif
     }
 
     public static boolean isEnableD3D12Presentation() {
         #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
-        return ENABLE_D3D12_PRESENTATION.get();
+        return getPresentationMode() == PresentationMode.D3D12;
         #else
         return false;
         #endif
@@ -654,9 +664,34 @@ public class SuperResolutionConfig {
     public static void setEnableD3D12Presentation(boolean value) {
         #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
         if (value) {
-            setEnableVulkanPresentation(false);
+            setPresentationMode(PresentationMode.D3D12);
+        } else if (getPresentationMode() == PresentationMode.D3D12) {
+            setPresentationMode(PresentationMode.OPENGL);
         }
-        ENABLE_D3D12_PRESENTATION.set(value);
+        #endif
+    }
+
+    public static PresentationMode getPresentationMode() {
+        #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
+        return PRESENTATION_MODE.get();
+        #else
+        return PresentationMode.OPENGL;
+        #endif
+    }
+
+    public static void setPresentationMode(PresentationMode mode) {
+        #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
+        if (mode == null) {
+            mode = PresentationMode.OPENGL;
+        }
+        PRESENTATION_MODE.set(mode);
+        // 同步遗留布尔值,避免老配置/读取路径不一致
+        if (ENABLE_VULKAN_PRESENTATION != null) {
+            ENABLE_VULKAN_PRESENTATION.set(mode == PresentationMode.VULKAN);
+        }
+        if (ENABLE_D3D12_PRESENTATION != null) {
+            ENABLE_D3D12_PRESENTATION.set(mode == PresentationMode.D3D12);
+        }
         #endif
     }
 

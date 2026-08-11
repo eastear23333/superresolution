@@ -5,6 +5,7 @@
 #include <string>
 #include "sr/xess/sr_provider.h"
 #include "XeSS/inc/xess/xess_vk.h"
+#include "XeSS/inc/xess/xess_d3d12.h"
 #include <windows.h>
 
 struct SRXeSSFunctionsTable {
@@ -26,6 +27,14 @@ struct SRXeSSFunctionsTable {
     xess_result_t (*xessVKExecute)(xess_context_handle_t, VkCommandBuffer, const xess_vk_execute_params_t *);
 
     xess_result_t (*xessSetVelocityScale)(xess_context_handle_t hContext, float x, float y);
+
+    // D3D12 backend (same libxess.dll, xess_d3d12.h exports)
+    xess_result_t (*xessD3D12CreateContext)(ID3D12Device *, xess_context_handle_t *);
+
+    xess_result_t (*xessD3D12Init)(xess_context_handle_t, const xess_d3d12_init_params_t *);
+
+    xess_result_t (*xessD3D12Execute)(xess_context_handle_t, ID3D12GraphicsCommandList *,
+                                      const xess_d3d12_execute_params_t *);
 };
 
 static SRXeSSFunctionsTable g_xessFunctions = {};
@@ -86,6 +95,10 @@ SR_API SRReturnCode srXeSSLoadFunctionsFromDll(const char *dllPath, SRMessageCal
     resolved &= srXeSSResolve(g_xessFunctions.xessGetProperties, "xessGetProperties", messageCallback);
     resolved &= srXeSSResolve(g_xessFunctions.xessVKExecute, "xessVKExecute", messageCallback);
     resolved &= srXeSSResolve(g_xessFunctions.xessSetVelocityScale, "xessSetVelocityScale", messageCallback);
+    // D3D12 backend symbols (present in the same libxess.dll)
+    resolved &= srXeSSResolve(g_xessFunctions.xessD3D12CreateContext, "xessD3D12CreateContext", messageCallback);
+    resolved &= srXeSSResolve(g_xessFunctions.xessD3D12Init, "xessD3D12Init", messageCallback);
+    resolved &= srXeSSResolve(g_xessFunctions.xessD3D12Execute, "xessD3D12Execute", messageCallback);
 
     if (!resolved) {
         FreeLibrary(g_xessModule);
@@ -170,7 +183,16 @@ extern "C" {
             0,
             NULL
         };
-        status = g_xessFunctions.xessVKInit(privateData->xessContext, &params);
+        if (context->desc.renderApiType == SR_RENDER_API_TYPE_D3D12) {
+            xess_d3d12_init_params_t d3d12Params = {};
+            d3d12Params.outputResolution = {desc->upscaledSize.x, desc->upscaledSize.y};
+            d3d12Params.qualitySetting = quality_settings;
+            d3d12Params.initFlags = initializeFlags;
+            // creationNodeMask / visibleNodeMask / heaps / pipelineLibrary 可缺省(0)
+            status = g_xessFunctions.xessD3D12Init(privateData->xessContext, &d3d12Params);
+        } else {
+            status = g_xessFunctions.xessVKInit(privateData->xessContext, &params);
+        }
         if (status != XESS_RESULT_SUCCESS) {
             desc->messageCallback(SR_MESSAGE_TYPE_ERROR, L"XeSS Context init failed");
             desc->messageCallback(SR_MESSAGE_TYPE_ERROR, std::to_wstring(status).c_str());
@@ -182,9 +204,10 @@ extern "C" {
     }
 
     SR_API SRReturnCode srXeSSCreateUpscaleContext(SRUpscaleContext *context, const SRCreateUpscaleContextDesc *desc) {
-        if (desc->renderApiType != SR_RENDER_API_TYPE_VULKAN) {
+        if (desc->renderApiType != SR_RENDER_API_TYPE_VULKAN
+            && desc->renderApiType != SR_RENDER_API_TYPE_D3D12) {
             if (desc->messageCallback) {
-                desc->messageCallback(SR_MESSAGE_TYPE_ERROR, L"XeSS only supports Vulkan");
+                desc->messageCallback(SR_MESSAGE_TYPE_ERROR, L"XeSS only supports Vulkan or D3D12");
             }
             return SR_RETURN_CODE_UNSUPPORTED_RENDER_API;
         }
@@ -201,11 +224,18 @@ extern "C" {
 
         ///////////////
         SRXeSSPrivateData *privateData = new SRXeSSPrivateData();
-        auto status = g_xessFunctions.xessVKCreateContext(
-            (VkInstance) desc->renderDeviceInfo.vulkan.instance,
-            (VkPhysicalDevice) desc->renderDeviceInfo.vulkan.physicalDevice,
-            (VkDevice) desc->renderDeviceInfo.vulkan.device,
-            &privateData->xessContext);
+        xess_result_t status;
+        if (desc->renderApiType == SR_RENDER_API_TYPE_D3D12) {
+            status = g_xessFunctions.xessD3D12CreateContext(
+                (ID3D12Device *) desc->renderDeviceInfo.d3d12.device,
+                &privateData->xessContext);
+        } else {
+            status = g_xessFunctions.xessVKCreateContext(
+                (VkInstance) desc->renderDeviceInfo.vulkan.instance,
+                (VkPhysicalDevice) desc->renderDeviceInfo.vulkan.physicalDevice,
+                (VkDevice) desc->renderDeviceInfo.vulkan.device,
+                &privateData->xessContext);
+        }
         if (status != XESS_RESULT_SUCCESS && status != XESS_RESULT_ERROR_UNSUPPORTED_DEVICE) {
             desc->messageCallback(SR_MESSAGE_TYPE_ERROR, L"XeSS Context create failed");
             desc->messageCallback(SR_MESSAGE_TYPE_ERROR, std::to_wstring(status).c_str());
@@ -302,6 +332,48 @@ extern "C" {
     SR_API SRReturnCode srXeSSDispatchUpscale(SRUpscaleContext *context, const SRDispatchUpscaleDesc *desc) {
         xess_context_handle_t xessContext = ((SRXeSSPrivateData *) context->userContext)->xessContext;
         xess_coord_t renderSize = ((SRXeSSPrivateData *) context->userContext)->renderSize;
+
+        if (context->desc.renderApiType == SR_RENDER_API_TYPE_D3D12) {
+            xess_d3d12_execute_params_t executeParams = {};
+            if (desc->color.exist) {
+                executeParams.pColorTexture = (ID3D12Resource *) desc->color.handle;
+            }
+            if (desc->depth.exist) {
+                executeParams.pDepthTexture = (ID3D12Resource *) desc->depth.handle;
+            }
+            if (desc->motionVectors.exist) {
+                executeParams.pVelocityTexture = (ID3D12Resource *) desc->motionVectors.handle;
+            }
+            if (desc->exposure.exist) {
+                executeParams.pExposureScaleTexture = (ID3D12Resource *) desc->exposure.handle;
+            }
+            if (desc->reactive.exist) {
+                executeParams.pResponsivePixelMaskTexture = (ID3D12Resource *) desc->reactive.handle;
+            }
+            if (desc->output.exist) {
+                executeParams.pOutputTexture = (ID3D12Resource *) desc->output.handle;
+            }
+            executeParams.jitterOffsetX = desc->jitterOffset.x;
+            executeParams.jitterOffsetY = desc->jitterOffset.y;
+            executeParams.exposureScale = desc->preExposure;
+            executeParams.resetHistory = desc->reset ? 1 : 0;
+            executeParams.inputWidth = desc->renderSize.x;
+            executeParams.inputHeight = desc->renderSize.y;
+            // pDescriptorHeap / descriptorHeapOffset / 各 *Base 坐标可缺省(0)
+            g_xessFunctions.xessSetVelocityScale(xessContext, desc->motionVectorScale.x, desc->motionVectorScale.y);
+            auto status = g_xessFunctions.xessD3D12Execute(
+                xessContext,
+                (ID3D12GraphicsCommandList *) desc->commandList.apiCommandBuffer.d3d12.commandList,
+                &executeParams);
+            if (status != XESS_RESULT_SUCCESS) {
+                ((SRXeSSPrivateData *) context->userContext)->
+                        messageCallback(SR_MESSAGE_TYPE_ERROR, L"XeSS D3D12 execute failed");
+                ((SRXeSSPrivateData *) context->userContext)->messageCallback(
+                    SR_MESSAGE_TYPE_ERROR, std::to_wstring(status).c_str());
+                return SR_RETURN_CODE_ERROR;
+            }
+            return (SRReturnCode) SR_RETURN_CODE_OK;
+        }
 
         xess_vk_execute_params_t executeParams = {};
         if (desc->color.exist) {
