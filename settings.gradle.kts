@@ -30,6 +30,10 @@ pluginManagement {
         maven(url = "https://libraries.minecraft.net")
         maven(url = "https://maven.parchmentmc.org/")
     }
+    plugins {
+        // Windows API FFM bindings for the D3D12 presentation mode (Java 25+).
+        id("net.codecrete.windows-api") version "0.8.6"
+    }
 }
 
 plugins {
