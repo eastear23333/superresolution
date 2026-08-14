@@ -38,6 +38,8 @@ import io.homo.superresolution.common.minecraft.B3DVulkanBridge;
 import io.homo.superresolution.common.minecraft.MinecraftUtils;
 import io.homo.superresolution.common.minecraft.handler.RenderHandlerManager;
 import io.homo.superresolution.common.optiscaler.OptiScalerLoader;
+import io.homo.superresolution.common.presentation.PresentationFeature;
+import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationWindow;
 import io.homo.superresolution.common.presentation.window.PresentationWindowState;
@@ -302,6 +304,11 @@ public final class SuperResolution implements Destroyable {
         try (GlState ignored = new GlState()) {
             RenderSystems.init();
 
+            // D3D12 presentation mode (FFM): owns the DXGI swap chain on the window.
+            if (D3D12PresentationFeature.isRequested()) {
+                D3D12PresentationFeature.initialize();
+            }
+
             if (minecraft == null) {
                 minecraft = Minecraft.getInstance();
             }
@@ -521,6 +528,7 @@ public final class SuperResolution implements Destroyable {
         graphicsBackendDestroyed = false;
         FrameGeneration.shutdown();
         VulkanPresentationFeature.shutdown();
+        D3D12PresentationFeature.shutdown();
         LowLatency.shutdown();
         if (currentAlgorithm != null) {
             currentAlgorithm.destroy();
@@ -538,7 +546,7 @@ public final class SuperResolution implements Destroyable {
         // GL resource cleanup) still has a current GL context. Destroying them here left
         // that rendering without a context and aborted the JVM on exit. Without the
         // interop presentation there is no shared context to protect, so tear down now.
-        if (!VulkanPresentationFeature.isRequested()) {
+        if (!PresentationFeature.isPresentationRequested()) {
             destroyGraphicsBackend();
         }
     }

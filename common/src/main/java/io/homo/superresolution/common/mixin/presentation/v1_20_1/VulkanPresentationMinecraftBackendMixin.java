@@ -16,23 +16,23 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package io.homo.superresolution.common.mixin.presentation.v26_1_x;
+package io.homo.superresolution.common.mixin.presentation.v1_20_1;
 
-#if MC_VER >= MC_26_1 && MC_VER < MC_26_2
-import com.mojang.blaze3d.platform.Window;
+#if MC_VER == MC_1_20_1
+import com.mojang.blaze3d.systems.RenderSystem;
 import io.homo.superresolution.common.presentation.PresentationFeature;
-import io.homo.superresolution.common.presentation.window.PresentationWindowState;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-@Mixin(Window.class)
-public abstract class VulkanPresentationWindowCloseMixin {
-    @Inject(method = "close", at = @At("TAIL"))
-    private void super_resolution$clearPresentationHandle(CallbackInfo ci) {
+@Mixin(RenderSystem.class)
+public abstract class VulkanPresentationMinecraftBackendMixin {
+    @Inject(method = "flipFrame", at = @At("HEAD"), cancellable = true, remap = false)
+    private static void super_resolution$skipOpenGlPresentation(CallbackInfo ci) {
         if (PresentationFeature.isPresentationRequested()) {
-            PresentationWindowState.clearPresentationAfterWindowClose();
+            RenderSystem.replayQueue();
+            ci.cancel();
         }
     }
 }
@@ -41,6 +41,6 @@ import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;
 
 @Mixin(Minecraft.class)
-public abstract class VulkanPresentationWindowCloseMixin {
+public abstract class VulkanPresentationMinecraftBackendMixin {
 }
 #endif

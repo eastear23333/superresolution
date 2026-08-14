@@ -23,6 +23,8 @@ import com.mojang.blaze3d.platform.DisplayData;
 import com.mojang.blaze3d.platform.ScreenManager;
 import com.mojang.blaze3d.platform.Window;
 import com.mojang.blaze3d.platform.WindowEventHandler;
+import io.homo.superresolution.common.presentation.PresentationFeature;
+import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;
 import io.homo.superresolution.common.presentation.window.PresentationWindowState;
 import io.homo.superresolution.core.graphics.GraphicsCapabilities;
@@ -55,7 +57,7 @@ public abstract class VulkanPresentationWindowMixin {
 
     @Inject(method = "close", at = @At("TAIL"))
     private void super_resolution$clearPresentationHandle(CallbackInfo ci) {
-        if (VulkanPresentationFeature.isRequested()) {
+        if (PresentationFeature.isPresentationRequested()) {
             PresentationWindowState.clearPresentationAfterWindowClose();
         }
     }
@@ -71,7 +73,7 @@ public abstract class VulkanPresentationWindowMixin {
             )
     )
     private void super_resolution$redirectWindow(WindowEventHandler eventHandler, ScreenManager screenManager, DisplayData displayData, String preferredFullscreenVideoMode, String title, CallbackInfo ci) {
-        if (VulkanPresentationFeature.isRequested()) {
+        if (PresentationFeature.isPresentationRequested()) {
             GLFW.glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
             GLFW.glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
         }
@@ -85,7 +87,7 @@ public abstract class VulkanPresentationWindowMixin {
             )
     )
     private void super_resolution$createRenderContext(WindowEventHandler eventHandler, ScreenManager screenManager, DisplayData displayData, String preferredFullscreenVideoMode, String title, CallbackInfo ci) {
-        if (!VulkanPresentationFeature.isRequested()) {
+        if (!PresentationFeature.isPresentationRequested()) {
             GLFW.glfwMakeContextCurrent(window);
             return;
         }
@@ -114,6 +116,9 @@ public abstract class VulkanPresentationWindowMixin {
             }
             PresentationWindowState.resetAfterStartupFailure();
             VulkanPresentationFeature.disableAfterFailure(throwable);
+            if (D3D12PresentationFeature.isRequested()) {
+                D3D12PresentationFeature.disableAfterFailure(throwable);
+            }
             if (throwable instanceof RuntimeException runtimeException) {
                 throw runtimeException;
             }

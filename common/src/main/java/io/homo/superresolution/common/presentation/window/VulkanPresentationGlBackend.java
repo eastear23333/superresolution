@@ -17,6 +17,7 @@ import com.mojang.blaze3d.shaders.GpuDebugOptions;
 import com.mojang.blaze3d.shaders.ShaderSource;
 import com.mojang.blaze3d.systems.BackendCreationException;
 import com.mojang.blaze3d.systems.GpuDevice;
+import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;
 import org.lwjgl.glfw.GLFW;
 
@@ -80,6 +81,9 @@ public final class VulkanPresentationGlBackend extends GlBackend {
             }
             PresentationWindowState.resetAfterStartupFailure();
             VulkanPresentationFeature.disableAfterFailure(throwable);
+            if (D3D12PresentationFeature.isRequested()) {
+                D3D12PresentationFeature.disableAfterFailure(throwable);
+            }
             return throwBackendCreationFailure(throwable);
         } finally {
             GLFW.glfwDefaultWindowHints();

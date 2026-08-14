@@ -16,9 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package io.homo.superresolution.common.mixin.presentation.v1_21_11;
+package io.homo.superresolution.common.mixin.presentation.v1_20_1;
 
-#if MC_VER >= MC_1_21_11 && MC_VER < MC_26_1
+#if MC_VER == MC_1_20_1
 import io.homo.superresolution.common.presentation.PresentationFeature;
 import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;

@@ -16,12 +16,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package io.homo.superresolution.common.mixin.presentation.v26_1_x;
+package io.homo.superresolution.common.mixin.presentation.v1_20_1;
 
-#if MC_VER >= MC_26_1 && MC_VER < MC_26_2
+#if MC_VER == MC_1_20_1
 import io.homo.superresolution.common.presentation.PresentationFeature;
 import io.homo.superresolution.common.presentation.capture.FrameCaptureManager;
-import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -31,16 +30,17 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(value = GameRenderer.class, priority = 900)
 public abstract class VulkanPresentationGameRendererCaptureMixin {
     @Inject(
-            method = "render(Lnet/minecraft/client/DeltaTracker;Z)V",
+            method = "render(FJZ)V",
             at = @At(
                     value = "INVOKE",
-                    target = "Lnet/minecraft/client/renderer/fog/FogRenderer;endFrame()V",
-                    shift = At.Shift.BEFORE
+                    target = "Lcom/mojang/blaze3d/pipeline/RenderTarget;bindWrite(Z)V",
+                    shift = At.Shift.AFTER
             )
     )
     private void super_resolution$captureHudlessColor(
-            DeltaTracker deltaTracker,
-            boolean advanceGameTime,
+            float partialTicks,
+            long nanoTime,
+            boolean renderLevel,
             CallbackInfo ci
     ) {
         if (PresentationFeature.isPresentationRequested()) {
@@ -48,10 +48,11 @@ public abstract class VulkanPresentationGameRendererCaptureMixin {
         }
     }
 
-    @Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V", at = @At("RETURN"))
+    @Inject(method = "render(FJZ)V", at = @At("RETURN"))
     private void super_resolution$captureFinalColor(
-            DeltaTracker deltaTracker,
-            boolean advanceGameTime,
+            float partialTicks,
+            long nanoTime,
+            boolean renderLevel,
             CallbackInfo ci
     ) {
         if (PresentationFeature.isPresentationRequested()) {

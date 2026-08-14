@@ -255,3 +255,22 @@ tasks.named<ProcessResources>("processResources") {
 tasks.matching { it.name == "remapSourcesJar" }.configureEach {
     enabled = false
 }
+
+// WindowsApiGenerator registers a generate*WindowsApi task per source set; the
+// fabric compile/sourcesJar consume all common source sets, so declare the
+// dependencies to satisfy Gradle's validation (only present for Java 25).
+if (versionConfig.common.javaVersion >= 25) {
+    val windowsApiTasks = listOf(
+        ":common:generateWindowsApi",
+        ":common:generateSharedWindowsApi",
+        ":common:generateIrisapiWindowsApi",
+        ":common:generateHackWindowsApi",
+        ":common:generateShadercompatWindowsApi",
+    )
+    tasks.named("compileJava") {
+        dependsOn(windowsApiTasks)
+    }
+    tasks.named("sourcesJar") {
+        dependsOn(windowsApiTasks)
+    }
+}

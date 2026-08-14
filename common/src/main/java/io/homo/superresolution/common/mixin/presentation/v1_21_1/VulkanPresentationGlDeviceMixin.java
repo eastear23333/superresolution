@@ -19,6 +19,8 @@
 package io.homo.superresolution.common.mixin.presentation.v1_21_1;
 
 #if MC_VER >= MC_1_21 && MC_VER < MC_1_21_2
+import io.homo.superresolution.common.presentation.PresentationFeature;
+import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationWindow;
 import io.homo.superresolution.common.presentation.window.PresentationWindowState;
@@ -31,8 +33,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class VulkanPresentationGlDeviceMixin {
     @Inject(method = "updateVsync", at = @At("HEAD"), cancellable = true)
     private void super_resolution$setVulkanVsync(boolean enabled, CallbackInfo ci) {
-        if (VulkanPresentationFeature.isRequested()) {
-            VulkanPresentationWindow.setVsync(enabled);
+        if (PresentationFeature.isPresentationRequested()) {
+            if (VulkanPresentationFeature.isRequested()) {
+                VulkanPresentationWindow.setVsync(enabled);
+            }
+            if (D3D12PresentationFeature.isRequested()) {
+                D3D12PresentationFeature.setVsync(enabled);
+            }
             ci.cancel();
         }
     }
@@ -46,7 +53,7 @@ public abstract class VulkanPresentationGlDeviceMixin {
             )
     )
     private void super_resolution$destroyRenderWindow(CallbackInfo ci) {
-        if (VulkanPresentationFeature.isRequested()) {
+        if (PresentationFeature.isPresentationRequested()) {
             PresentationWindowState.destroyRenderWindow();
         }
     }

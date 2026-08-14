@@ -16,9 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package io.homo.superresolution.common.mixin.presentation.v1_21_11;
+package io.homo.superresolution.common.mixin.presentation.v1_20_1;
 
-#if MC_VER >= MC_1_21_11 && MC_VER < MC_26_1
+#if MC_VER == MC_1_20_1
 import com.mojang.blaze3d.platform.DisplayData;
 import com.mojang.blaze3d.platform.ScreenManager;
 import com.mojang.blaze3d.platform.Window;
@@ -35,6 +35,7 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import static org.lwjgl.glfw.GLFW.*;
@@ -45,7 +46,14 @@ public abstract class VulkanPresentationWindowMixin {
     private static final String HELPER_TITLE = "Super Resolution OpenGL Context";
     @Shadow
     @Final
-    private long handle;
+    private long window;
+
+    @Redirect(
+            method = "<init>",
+            at = @At(value = "INVOKE", target = "Lorg/lwjgl/glfw/GLFW;glfwMakeContextCurrent(J)V")
+    )
+    private void super_resolution$skipPresentationContextBinding(long window) {
+    }
 
     @Inject(method = "close", at = @At("TAIL"))
     private void super_resolution$clearPresentationHandle(CallbackInfo ci) {
@@ -58,8 +66,9 @@ public abstract class VulkanPresentationWindowMixin {
             method = "<init>",
             at = @At(
                     value = "INVOKE",
-                    target = "Lorg/lwjgl/glfw/GLFW;glfwCreateWindow(IILjava/lang/CharSequence;JJ)J",
-                    unsafe = true
+                    target = "Lorg/lwjgl/glfw/GLFW;glfwWindowHint(II)V",
+                    ordinal = 5,
+                    shift = At.Shift.AFTER
             )
     )
     private void super_resolution$redirectWindow(WindowEventHandler eventHandler, ScreenManager screenManager, DisplayData displayData, String preferredFullscreenVideoMode, String title, CallbackInfo ci) {
@@ -68,23 +77,23 @@ public abstract class VulkanPresentationWindowMixin {
             GLFW.glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
         }
     }
+
     @Inject(
             method = "<init>",
             at = @At(
                     value = "INVOKE",
-                    target = "Lcom/mojang/blaze3d/platform/Window;setMode()V",
-                    unsafe = true,
-                    shift = At.Shift.BEFORE
+                    target = "Lorg/lwjgl/glfw/GLFW;glfwMakeContextCurrent(J)V"
             )
     )
     private void super_resolution$createRenderContext(WindowEventHandler eventHandler, ScreenManager screenManager, DisplayData displayData, String preferredFullscreenVideoMode, String title, CallbackInfo ci) {
         if (!PresentationFeature.isPresentationRequested()) {
+            GLFW.glfwMakeContextCurrent(window);
             return;
         }
 
         long openglWindow = 0L;
         try {
-            PresentationWindowState.attachPresentation(this.handle);
+            PresentationWindowState.attachPresentation(this.window);
             GLFW.glfwDefaultWindowHints();
             GLFW.glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
             // Create the helper visible so Optimus binds the NVIDIA adapter (a hidden
@@ -102,6 +111,7 @@ public abstract class VulkanPresentationWindowMixin {
             }
             GLFW.glfwHideWindow(openglWindow);
             PresentationWindowState.attachRender(openglWindow);
+            GLFW.glfwMakeContextCurrent(PresentationWindowState.renderHandle());
         } catch (Throwable throwable) {
             if (openglWindow != 0L && !PresentationWindowState.isRender(openglWindow)) {
                 GLFW.glfwDestroyWindow(openglWindow);

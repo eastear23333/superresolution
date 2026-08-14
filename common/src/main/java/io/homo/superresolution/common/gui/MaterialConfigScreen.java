@@ -126,10 +126,10 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
     private static final float GROUP_TITLE_PILL_MIN_HEIGHT = 30f;
     private static final float FRAME_TITLE_PILL_HORIZONTAL_PADDING = 16f;
     private static final float GROUP_TITLE_PILL_HORIZONTAL_PADDING = 9f;
-    #if MC_VER >= MC_1_21_11 && MC_VER < MC_26_2 || MC_VER >= MC_1_21 && MC_VER < MC_1_21_2
-    private static final boolean CURRENT_VERSION_SUPPORTS_VULKAN_PRESENTATION = true;
+    #if MC_VER >= MC_1_20_1 && MC_VER < MC_26_2
+    private static final boolean CURRENT_VERSION_SUPPORTS_PRESENTATION = true;
     #else
-    private static final boolean CURRENT_VERSION_SUPPORTS_VULKAN_PRESENTATION = false;
+    private static final boolean CURRENT_VERSION_SUPPORTS_PRESENTATION = false;
     #endif
 
     private final Screen parentScreen;
@@ -728,7 +728,7 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                     .setText(Text.translatable("superresolution.screen.config.hint.b3d_vulkan_unavailable.text").getString())
                     .setDisplayRequirement(OptionRequirement.isTrue(B3DVulkanBridge::isB3DVulkanBackend))
                     .build();
-            if (!CURRENT_VERSION_SUPPORTS_VULKAN_PRESENTATION) {
+            if (!CURRENT_VERSION_SUPPORTS_PRESENTATION) {
                 builder.hintOption(Text.literal("vulkan_presentation_unavailable"))
                         .setIcon(MaterialSymbols.iconWarning())
                         .setTitle(Text.translatable("superresolution.screen.config.hint.vulkan_presentation_unavailable.title").getString())
@@ -1005,7 +1005,7 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                 }
         );
 
-        if (CURRENT_VERSION_SUPPORTS_VULKAN_PRESENTATION) {
+        if (CURRENT_VERSION_SUPPORTS_PRESENTATION) {
             addLabeledOptionGroup(
                 container,
                 Text.translatable("superresolution.screen.config.category.presentation"),
