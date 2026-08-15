@@ -20,10 +20,13 @@ package io.homo.superresolution.api;
 
 import io.homo.superresolution.api.registry.AlgorithmDescription;
 import io.homo.superresolution.common.SuperResolution;
+import io.homo.superresolution.common.lowlatency.xell.XeLLowLatency;
 import io.homo.superresolution.common.minecraft.handler.RenderHandlerManager;
 import io.homo.superresolution.core.graphics.impl.framebuffer.IFrameBuffer;
 import net.neoforged.bus.api.BusBuilder;
 import net.neoforged.bus.api.IEventBus;
+
+import java.lang.foreign.MemorySegment;
 
 public class SuperResolutionAPI {
     public static final IEventBus EVENT_BUS = BusBuilder.builder().build();
@@ -58,5 +61,15 @@ public class SuperResolutionAPI {
 
     public static AbstractAlgorithm getCurrentAlgorithm() {
         return SuperResolution.currentAlgorithm;
+    }
+
+    /**
+     * The active Intel XeLL context handle (opaque), or {@link MemorySegment#NULL} when
+     * XeLL is not active. The XeSS-FG backend connects its swap-chain context to it via
+     * {@code xefgSwapChainSetLatencyReduction}. XeLL must outlive the XeSS-FG context, so
+     * callers must not destroy it through this API.
+     */
+    public static MemorySegment getXellContext() {
+        return XeLLowLatency.context();
     }
 }

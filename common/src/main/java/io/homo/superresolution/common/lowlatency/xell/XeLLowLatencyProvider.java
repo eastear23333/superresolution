@@ -121,6 +121,7 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
             context = pContext.get(ADDRESS, 0);
             appliedFrameIntervalUs = LowLatency.frameLimitUs();
             applySleepMode(arena, context, setSleepMode, appliedFrameIntervalUs);
+            XeLLowLatency.setContext(context);
             SuperResolution.LOGGER.info("[XeLL] context created");
         } catch (Throwable throwable) {
             SuperResolution.LOGGER.error("[XeLL] initialization failed", throwable);
@@ -210,6 +211,7 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
                 SuperResolution.LOGGER.warn("[XeLL] destroyContext failed", throwable);
             }
         }
+        XeLLowLatency.setContext(null);
         if (arena != null) {
             arena.close();
         }
