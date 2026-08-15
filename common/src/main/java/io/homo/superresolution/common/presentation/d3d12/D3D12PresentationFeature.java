@@ -111,7 +111,11 @@ public final class D3D12PresentationFeature {
             try {
                 presentationContext.resize(Math.max(w, 1), Math.max(h, 1));
             } catch (Throwable throwable) {
-                SuperResolution.LOGGER.warn("D3D12 swapchain resize failed", throwable);
+                // Resize could not recover: the old swap chain is already released, so
+                // continuing to present would use-after-free. Disable D3D12 presentation
+                // to fall back safely instead of crashing.
+                SuperResolution.LOGGER.warn("D3D12 swapchain resize failed, disabling D3D12 presentation", throwable);
+                disableAfterFailure(throwable);
                 return;
             }
         }

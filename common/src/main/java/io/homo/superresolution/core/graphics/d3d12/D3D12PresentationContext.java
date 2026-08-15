@@ -477,6 +477,13 @@ public final class D3D12PresentationContext implements AutoCloseable {
         checkHr(listIface.Close());
         queueIface.ExecuteCommandLists(1, arena.allocateFrom(ADDRESS, commandList));
 
+        // GetBuffer above added a reference to the back buffer; the copy is now submitted,
+        // so release it. Not releasing leaks one back buffer reference per present, which
+        // makes ResizeBuffers fail with DXGI_ERROR_INVALID_CALL (and, when a DLL like
+        // OptiScaler wraps the swap chain, leaves the window's flip-model swap chain alive
+        // so recreate also fails with E_ACCESSDENIED).
+        windows.win32.graphics.direct3d12.ID3D12Resource.wrap(backBuffer).Release();
+
         // Wait until the GL flipY has actually completed on the GPU (fence >= captureValue)
         // before presenting. Without this the D3D12 copy can race ahead of flipY and the
         // presented back buffer shows an earlier frame ("rolling back to a previous frame").
@@ -559,12 +566,15 @@ public final class D3D12PresentationContext implements AutoCloseable {
             try {
                 recreateSwapchain(newWidth, newHeight);
             } catch (Throwable throwable) {
-                io.homo.superresolution.common.SuperResolution.LOGGER.warn(
+                // recreateSwapchain released the old swap chain before attempting to create
+                // the replacement, so the swapchain field now dangles. Re-throw so the caller
+                // skips present and disables D3D12 presentation instead of presenting through
+                // a freed swap chain (use-after-free crash).
+                io.homo.superresolution.common.SuperResolution.LOGGER.error(
                         "[D3D12] ResizeBuffers to {}x{} failed 0x{} and recreate failed; "
-                                + "keeping {}x{}",
-                        newWidth, newHeight, Integer.toHexString(lastHr), width, height,
-                        throwable);
-                return;
+                                + "disabling D3D12 presentation",
+                        newWidth, newHeight, Integer.toHexString(lastHr), throwable);
+                throw throwable;
             }
         }
         // The back buffer changed size, so the capture texture must be rebuilt to match;
