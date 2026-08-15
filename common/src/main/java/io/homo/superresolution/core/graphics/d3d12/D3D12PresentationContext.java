@@ -11,6 +11,7 @@
 package io.homo.superresolution.core.graphics.d3d12;
 
 #if MC_VER >= MC_1_20_1 && MC_VER < MC_26_2
+import io.homo.superresolution.common.framegeneration.D3D12FrameGeneration;
 import io.homo.superresolution.common.lowlatency.LowLatency;
 import io.homo.superresolution.common.upscale.InteropResourcesConverter;
 import io.homo.superresolution.core.NativeLibManager;
@@ -50,6 +51,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
     private final MemorySegment device;
     private final MemorySegment queue;
     private MemorySegment swapchain;
+    private MemorySegment factory;
     private final MemorySegment commandAllocator;
     private final MemorySegment commandList;
     private final MemorySegment fence;
@@ -66,8 +68,8 @@ public final class D3D12PresentationContext implements AutoCloseable {
 
     private D3D12PresentationContext(
             Arena arena, long hwnd, MemorySegment device, MemorySegment queue, MemorySegment swapchain,
-            MemorySegment commandAllocator, MemorySegment commandList, MemorySegment fence,
-            MemorySegment captureTexture, long captureAllocationSize,
+            MemorySegment factory, MemorySegment commandAllocator, MemorySegment commandList,
+            MemorySegment fence, MemorySegment captureTexture, long captureAllocationSize,
             GlD3D12ImportableTexture2D captureGlTexture, D3D12InteropSemaphore semaphore,
             int width, int height) {
         this.arena = arena;
@@ -75,6 +77,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.device = device;
         this.queue = queue;
         this.swapchain = swapchain;
+        this.factory = factory;
         this.commandAllocator = commandAllocator;
         this.commandList = commandList;
         this.fence = fence;
@@ -183,7 +186,8 @@ public final class D3D12PresentationContext implements AutoCloseable {
                     new GlD3D12ImportableTexture2D(glResource);
 
             return new D3D12PresentationContext(
-                    arena, hwnd, devicePtr, queuePtr, swapchainPtr, allocatorPtr, listPtr, fencePtr,
+                    arena, hwnd, devicePtr, queuePtr, swapchainPtr, ppFactory.get(ADDRESS, 0),
+                    allocatorPtr, listPtr, fencePtr,
                     captureTexture, allocationSize, captureGlTexture, semaphore, width, height);
         } catch (Throwable throwable) {
             arena.close();
@@ -509,6 +513,9 @@ public final class D3D12PresentationContext implements AutoCloseable {
         // present path; the D3D12 presentation has no equivalent hook, so do it here for
         // the XeLL low-latency provider (present-start/end frame the swapchain Present).
         LowLatency.beginPresent();
+        // If XeSS-FG took over the swap chain, tag constants and set the present id right
+        // before Present so the proxy can generate interpolated frames.
+        D3D12FrameGeneration.beforePresent((int) (LowLatency.currentLatencyFrameId() & 0xFFFFFFFFL));
         swapchainIface.Present(vsync ? 1 : 0, 0);
         LowLatency.endPresent();
 
@@ -601,6 +608,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
                 0, windows.win32.graphics.dxgi.IDXGIFactory6.iid(), ppFactory));
         windows.win32.graphics.dxgi.IDXGIFactory6 factory =
                 windows.win32.graphics.dxgi.IDXGIFactory6.wrap(ppFactory.get(ADDRESS, 0));
+        this.factory = ppFactory.get(ADDRESS, 0);
         MemorySegment scDesc = buildSwapchainDesc(arena, newWidth, newHeight);
         MemorySegment ppNew = arena.allocate(ADDRESS);
         checkHr(factory.CreateSwapChainForHwnd(
@@ -665,6 +673,31 @@ public final class D3D12PresentationContext implements AutoCloseable {
     /** The FFM D3D12 device segment, used by the XeLL low-latency provider. */
     public MemorySegment device() {
         return device;
+    }
+
+    /** The FFM D3D12 command queue, used by the XeSS-FG backend. */
+    public MemorySegment queue() {
+        return queue;
+    }
+
+    /** The Win32 window handle the swap chain is attached to. */
+    public long hwnd() {
+        return hwnd;
+    }
+
+    /** The current DXGI swap chain (may be a XeSS-FG proxy swap chain). */
+    public MemorySegment swapchain() {
+        return swapchain;
+    }
+
+    /** The DXGI factory used to create the swap chain, for the XeSS-FG backend. */
+    public MemorySegment factory() {
+        return factory;
+    }
+
+    /** Replaces the swap chain, e.g. with the XeSS-FG proxy swap chain. */
+    public void setSwapchain(MemorySegment swapchain) {
+        this.swapchain = swapchain;
     }
 
     /** Matches the OpenGL vsync setting: flip-model Present uses syncInterval 1 (wait for

@@ -23,6 +23,12 @@ public final class FrameGenerationGroups {
             Component.translatable("superresolution.algorithm.frame_generation.dlss")
     );
 
+    /** Intel XeSS-FG (XeSS Frame Generation). Backends are contributed by other mods. */
+    public static final BackendGroup XESS_FG = BackendGroup.of(
+            "superresolution:xess_fg",
+            Component.translatable("superresolution.algorithm.frame_generation.xess_fg")
+    );
+
     private FrameGenerationGroups() {
     }
 }

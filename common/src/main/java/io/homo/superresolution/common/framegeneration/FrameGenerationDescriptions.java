@@ -87,6 +87,18 @@ public final class FrameGenerationDescriptions {
                         .build()
         );
 
+        // Intel XeSS Frame Generation group representative. Concrete backends are
+        // registered by the Wisteria mod through FrameGenerationRegisterEvent and join
+        // this group via .group(XESS_FG).
+        FrameGenerationRegistry.register(
+                FrameGenerationDescription.builder()
+                        .id(FrameGenerationGroups.XESS_FG.getId())
+                        .displayName(FrameGenerationGroups.XESS_FG.getDisplayName())
+                        .automatic()
+                        .group(FrameGenerationGroups.XESS_FG)
+                        .build()
+        );
+
         SuperResolutionAPI.EVENT_BUS.post(new FrameGenerationRegisterEvent());
     }
 }

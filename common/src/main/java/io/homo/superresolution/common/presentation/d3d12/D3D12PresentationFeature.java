@@ -15,6 +15,7 @@ import io.homo.superresolution.api.SuperResolutionAPI;
 import io.homo.superresolution.common.SuperResolution;
 import io.homo.superresolution.common.config.SuperResolutionConfig;
 import io.homo.superresolution.common.config.enums.PresentationMode;
+import io.homo.superresolution.common.framegeneration.D3D12FrameGeneration;
 import io.homo.superresolution.common.lowlatency.LowLatency;
 import io.homo.superresolution.common.minecraft.MinecraftWindow;
 import io.homo.superresolution.core.graphics.d3d12.D3D12PresentationContext;
@@ -92,6 +93,9 @@ public final class D3D12PresentationFeature {
         // The window was created hidden (GLFW_VISIBLE=false) by the presentation
         // window mixin; show it now that the swap chain is ready.
         GLFW.glfwShowWindow(window);
+        // If XeSS-FG is the configured frame-generation choice, it takes over the swap
+        // chain here (a no-op otherwise).
+        D3D12FrameGeneration.initialize(context);
         return true;
     }
 
@@ -144,7 +148,17 @@ public final class D3D12PresentationFeature {
         return presentationContext == null ? null : presentationContext.device();
     }
 
+    /**
+     * The active D3D12 presentation context, or null. Exposes the D3D12 device/queue/
+     * swap chain/factory to the XeSS-FG backend so it can build the proxy swap chain.
+     */
+    public static D3D12PresentationContext context() {
+        return context;
+    }
+
     public static synchronized void shutdown() {
+        // XeSS-FG must be torn down before the D3D12 device/swap chain it borrowed.
+        D3D12FrameGeneration.shutdown();
         if (context != null) {
             context.close();
             context = null;
@@ -183,6 +197,10 @@ public final class D3D12PresentationFeature {
     }
 
     public static MemorySegment contextDevice() {
+        return null;
+    }
+
+    public static io.homo.superresolution.core.graphics.d3d12.D3D12PresentationContext context() {
         return null;
     }
 }

@@ -359,13 +359,11 @@ if (publishingApiToShnexus && minecraftVersionConfig != "1.21.1") {
 // resolve to the task's own container, since Task is ExtensionAware too.
 val apiMainOutput = extensions.getByType<SourceSetContainer>().named("main").get().output
 
-// Java 21, i.e. the 1.21.1 configuration. The published API is a single artifact shared
-// by every Minecraft version that consumes it, so it has to be readable by the oldest
-// toolchain among them. 1.20.1 (Java 17) is deliberately not part of that set: no
-// consumer targets it, and holding the API back to Java 17 for its sake would be a cost
-// with no benefit.
-val apiMaxClassFileMajor = 65
-val apiSourceVersionConfig = "1.21.1"
+// Every supported configuration now builds at Java 25 (java_version=25 in configs/*.json),
+// so the published API is Java 25 (class file major 69) and every consumer — including
+// Wisteria, which also targets Java 25 — must be able to read it.
+val apiMaxClassFileMajor = 69
+val apiSourceVersionConfig = "1.21.11"
 
 val apiJar = tasks.register<Jar>("apiJar") {
     group = "publishing"

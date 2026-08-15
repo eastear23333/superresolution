@@ -4,6 +4,7 @@
     "key.super_resolution.open_config": "Open Configuration Screen",
     "superresolution.algorithm.frame_generation.auto": "Auto",
     "superresolution.algorithm.frame_generation.dlss": "DLSS Frame Generation",
+    "superresolution.algorithm.frame_generation.xess_fg": "XeSS Frame Generation",
     "superresolution.algorithm.low_latency.none": "Off",
     "superresolution.algorithm.low_latency.nv_reflex": "NVIDIA Reflex",
     "superresolution.algorithm.low_latency.intel_xell": "Intel XeLL",
