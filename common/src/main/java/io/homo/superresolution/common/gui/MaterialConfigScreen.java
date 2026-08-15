@@ -28,6 +28,7 @@ import io.homo.superresolution.api.registry.LowLatencyGroups;
 import io.homo.superresolution.api.registry.ExtraResource;
 import io.homo.superresolution.api.registry.ExtraResources;
 import io.homo.superresolution.common.SuperResolution;
+import io.homo.superresolution.common.presentation.PresentationFeature;
 import io.homo.superresolution.common.config.SuperResolutionConfig;
 import io.homo.superresolution.common.config.enums.CaptureMode;
 import io.homo.superresolution.common.config.enums.InternalTextureFormat;
@@ -1032,7 +1033,17 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                                                 : "superresolution.screen.config.options.tooltip.presentation_mode"
                                 ).getString()
                         )))
-                        .setSaveConsumer(SuperResolutionConfig::setPresentationMode)
+                        .setSaveConsumer((Consumer<PresentationMode>) mode -> {
+                            SuperResolutionConfig.setPresentationMode(mode);
+                            // Any presentation-mode change invalidates the currently
+                            // selected low-latency backend (Reflex needs Vulkan, XeLL needs
+                            // D3D12): force it back to None immediately so a stale mode
+                            // cannot crash at runtime once the presentation mixins change.
+                            if (!LowLatencyGroups.NONE.getId().equals(SuperResolutionConfig.getLowLatencyMode())) {
+                                SuperResolutionConfig.setLowLatencyMode(LowLatencyGroups.NONE.getId());
+                                LowLatency.setMode(LowLatencyGroups.NONE.getId());
+                            }
+                        })
                         .build()
         );
 
@@ -1052,15 +1063,38 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                             .setNameProvider(g -> g.getDisplayName().getString())
                             .setValuesSupplier(this::lowLatencyGroups)
                             .setDescription(Text.translatable("superresolution.screen.config.options.tooltip.low_latency_mode"))
-                            .setEnableRequirement(SuperResolutionConfig::isEnableVulkanPresentation)
+                            // Read the presentation mode config directly (not the cached
+                            // feature flags) so the group collapses immediately when OpenGL
+                            // is selected in this same screen.
+                            .setDisplayRequirement(OptionRequirement.isTrue(
+                                    () -> SuperResolutionConfig.getPresentationMode() != PresentationMode.OPENGL))
+                            .setEnableRequirement(
+                                    () -> SuperResolutionConfig.getPresentationMode() != PresentationMode.OPENGL)
                             .setTooltipSupplier(value -> Optional.of(Tooltip.withContext(
                                     Text.translatable(
-                                            SuperResolutionConfig.isEnableVulkanPresentation()
+                                            SuperResolutionConfig.getPresentationMode() != PresentationMode.OPENGL
                                                     ? "superresolution.screen.config.options.tooltip.low_latency_mode"
-                                                    : "superresolution.screen.config.options.tooltip.low_latency_mode.vulkan_presentation_required"
+                                                    : "superresolution.screen.config.options.tooltip.low_latency_mode.presentation_required"
                                     ).getString()
                             )))
                             .setItemEnableRequirement(this::getLowLatencyGroupItemRequirement)
+                            .setMenuItemTooltipSupplier(group -> {
+                                BackendGroup backendGroup = (BackendGroup) group;
+                                // Only annotate entries that are currently disabled because
+                                // their backing presentation API is not active.
+                                if (getLowLatencyGroupItemRequirement(backendGroup).check()) {
+                                    return Optional.empty();
+                                }
+                                if (LowLatencyGroups.NV_REFLEX.equals(backendGroup)) {
+                                    return Optional.of(Tooltip.withContext(
+                                            Text.translatable("superresolution.screen.config.options.tooltip.low_latency_mode.requires_vulkan").getString()));
+                                }
+                                if (LowLatencyGroups.XE_LL.equals(backendGroup)) {
+                                    return Optional.of(Tooltip.withContext(
+                                            Text.translatable("superresolution.screen.config.options.tooltip.low_latency_mode.requires_d3d12").getString()));
+                                }
+                                return Optional.empty();
+                            })
                             .setSaveConsumer((Consumer<BackendGroup>) group -> {
                                 SuperResolutionConfig.setLowLatencyMode(group.getId());
                                 LowLatency.setMode(group.getId());

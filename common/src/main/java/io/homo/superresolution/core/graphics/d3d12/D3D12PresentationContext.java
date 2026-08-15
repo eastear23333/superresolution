@@ -11,6 +11,7 @@
 package io.homo.superresolution.core.graphics.d3d12;
 
 #if MC_VER >= MC_1_20_1 && MC_VER < MC_26_2
+import io.homo.superresolution.common.lowlatency.LowLatency;
 import io.homo.superresolution.common.upscale.InteropResourcesConverter;
 import io.homo.superresolution.core.NativeLibManager;
 import io.homo.superresolution.core.graphics.impl.texture.ITexture;
@@ -504,7 +505,12 @@ public final class D3D12PresentationContext implements AutoCloseable {
                     captureValue, fenceIface.GetCompletedValue());
         }
 
+        // Stamp the present latency markers. The Vulkan swapchain does this in its own
+        // present path; the D3D12 presentation has no equivalent hook, so do it here for
+        // the XeLL low-latency provider (present-start/end frame the swapchain Present).
+        LowLatency.beginPresent();
         swapchainIface.Present(vsync ? 1 : 0, 0);
+        LowLatency.endPresent();
 
         long signalValue = nextGlFence + 1;
         queueIface.Signal(fence, signalValue);
@@ -654,6 +660,11 @@ public final class D3D12PresentationContext implements AutoCloseable {
 
     public int height() {
         return height;
+    }
+
+    /** The FFM D3D12 device segment, used by the XeLL low-latency provider. */
+    public MemorySegment device() {
+        return device;
     }
 
     /** Matches the OpenGL vsync setting: flip-model Present uses syncInterval 1 (wait for

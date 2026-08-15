@@ -22,7 +22,10 @@ import io.homo.superresolution.common.config.special.SpecialConfigDescription;
 import io.homo.superresolution.common.framegeneration.FrameGeneration;
 import io.homo.superresolution.common.lowlatency.nv.NVIDIAReflexMode;
 import io.homo.superresolution.common.lowlatency.nv.NVIDIAReflexVulkanProvider;
+import io.homo.superresolution.common.lowlatency.xell.XeLLowLatencyProvider;
+import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;
+import io.homo.superresolution.core.NativeLibManager;
 import net.minecraft.network.chat.Component;
 
 import java.util.Optional;
@@ -34,6 +37,10 @@ public final class LowLatencyDescriptions {
     public static final String NV_REFLEX_GROUP_ID = LowLatencyGroups.NV_REFLEX.getId();
     /** SR-provided backend inside the NV_REFLEX group. */
     public static final String REFLEX_VK_BACKEND_ID = "superresolution:reflex_vk";
+    /** Group representative id for the Intel XeLL algorithm group. */
+    public static final String XE_LL_GROUP_ID = LowLatencyGroups.XE_LL.getId();
+    /** SR-provided backend inside the XE_LL group. */
+    public static final String XELL_BACKEND_ID = "superresolution:xell_d3d12";
 
     private static boolean registered;
 
@@ -98,6 +105,33 @@ public final class LowLatencyDescriptions {
                                                 && NVIDIAReflexVulkanProvider.isSupported())
                         )
                         .providerFactory(NVIDIAReflexVulkanProvider::new)
+                        .build()
+        );
+
+        // Intel XeLL — group representative, the D3D12 counterpart to Reflex under Vulkan.
+        LowLatencyRegistry.register(
+                LowLatencyDescription.builder()
+                        .id(XE_LL_GROUP_ID)
+                        .displayName(LowLatencyGroups.XE_LL.getDisplayName())
+                        .providerFactory(NoneLowLatency::new)
+                        .build()
+        );
+
+        // Intel XeLL backend inside the XE_LL group. Gated on the D3D12 presentation being
+        // actually active (mirrors how the Reflex backend requires the Vulkan presentation)
+        // and on the libxell.dll runtime being available.
+        LowLatencyRegistry.register(
+                LowLatencyDescription.builder()
+                        .id(XELL_BACKEND_ID)
+                        .displayName(Component.literal("Intel XeLL"))
+                        .group(LowLatencyGroups.XE_LL)
+                        .priority(100)
+                        .requirement(
+                                Requirement.nothing()
+                                        .isTrue(() -> D3D12PresentationFeature.isInitialized()
+                                                && NativeLibManager.xellAvailable())
+                        )
+                        .providerFactory(XeLLowLatencyProvider::new)
                         .build()
         );
 

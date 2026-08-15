@@ -30,6 +30,12 @@ public final class LowLatencyGroups {
             Component.translatable("superresolution.algorithm.low_latency.nv_reflex")
     );
 
+    /** Intel XeLL. Only available under D3D12 presentation (its counterpart to Reflex under Vulkan). */
+    public static final BackendGroup XE_LL = BackendGroup.of(
+            "superresolution:intel_xell",
+            Component.translatable("superresolution.algorithm.low_latency.intel_xell")
+    );
+
     private LowLatencyGroups() {
     }
 }

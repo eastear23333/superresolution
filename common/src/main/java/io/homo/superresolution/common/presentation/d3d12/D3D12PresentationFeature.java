@@ -15,6 +15,7 @@ import io.homo.superresolution.api.SuperResolutionAPI;
 import io.homo.superresolution.common.SuperResolution;
 import io.homo.superresolution.common.config.SuperResolutionConfig;
 import io.homo.superresolution.common.config.enums.PresentationMode;
+import io.homo.superresolution.common.lowlatency.LowLatency;
 import io.homo.superresolution.common.minecraft.MinecraftWindow;
 import io.homo.superresolution.core.graphics.d3d12.D3D12PresentationContext;
 import io.homo.superresolution.core.graphics.impl.framebuffer.FrameBufferAttachmentType;
@@ -22,6 +23,8 @@ import io.homo.superresolution.core.graphics.impl.framebuffer.IFrameBuffer;
 import io.homo.superresolution.core.graphics.impl.texture.ITexture;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeWin32;
+
+import java.lang.foreign.MemorySegment;
 
 /**
  * D3D12 presentation mode runtime (FFM). Owns a DXGI flip-model swap chain on
@@ -122,11 +125,23 @@ public final class D3D12PresentationFeature {
         if (finalColor == null) {
             return;
         }
+        // The Vulkan path stamps render-submit-end from its presentation window; the D3D12
+        // presentation has no such hook, so stamp it here so the XeLL markers are complete.
+        LowLatency.endRenderSubmission();
         presentationContext.present(finalColor);
     }
 
     public static boolean isInitialized() {
         return context != null;
+    }
+
+    /**
+     * The FFM D3D12 device of the active presentation, or null when the D3D12
+     * presentation is not initialized. Used by the XeLL low-latency provider.
+     */
+    public static MemorySegment contextDevice() {
+        D3D12PresentationContext presentationContext = context;
+        return presentationContext == null ? null : presentationContext.device();
     }
 
     public static synchronized void shutdown() {
@@ -165,6 +180,10 @@ public final class D3D12PresentationFeature {
     }
 
     public static void disableAfterFailure(Throwable failure) {
+    }
+
+    public static MemorySegment contextDevice() {
+        return null;
     }
 }
 #endif

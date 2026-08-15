@@ -56,6 +56,7 @@ public class NativeLibManager {
     public static NativeLib LIB_SUPER_RESOLUTION_NGX = null;
     public static NativeLib LIB_SUPER_RESOLUTION_STREAMLINE = null;
     public static NativeLib LIB_NGX_DLSSG_SNIPPET = null;
+    public static NativeLib LIB_SUPER_RESOLUTION_XELL = null;
     private static boolean nativeApiAvailable;
     private static boolean librariesExtracted;
     private static boolean librariesLoaded;
@@ -101,6 +102,15 @@ public class NativeLibManager {
                     shouldLoad,
                     shouldExtract
             );
+            // Intel Xe Low Latency runtime (libxell.dll). Extracted only; the
+            // XeLLowLatency provider loads it via FFM when the D3D12 presentation
+            // is active. Optional: the provider degrades gracefully if missing.
+            LIB_SUPER_RESOLUTION_XELL = new NativeLib(
+                    "libxell",
+                    false,
+                    false,
+                    true
+            );
 
             libs.add(LIB_SUPER_RESOLUTION);
             libs.add(LIB_SUPER_RESOLUTION_D3D12_INTEROP);
@@ -109,6 +119,7 @@ public class NativeLibManager {
             libs.add(LIB_SUPER_RESOLUTION_XESS);
             libs.add(LIB_SUPER_RESOLUTION_NGX);
             libs.add(LIB_SUPER_RESOLUTION_STREAMLINE);
+            libs.add(LIB_SUPER_RESOLUTION_XELL);
         } else if (operatingSystem.type == OperatingSystemType.ANDROID && operatingSystem.arch == SystemArchitecture.AARCH64) {
             LIB_SUPER_RESOLUTION = new NativeLib("SuperResolution", true, true);
             libs.add(LIB_SUPER_RESOLUTION);
@@ -136,6 +147,16 @@ public class NativeLibManager {
     public static boolean d3d12InteropAvailable() {
         return LIB_SUPER_RESOLUTION_D3D12_INTEROP != null
                 && LIB_SUPER_RESOLUTION_D3D12_INTEROP.available;
+    }
+
+    /**
+     * Whether the Intel XeLL runtime (libxell.dll) is available. libxell.dll is a plain
+     * C DLL (no JNI_OnLoad), so it is extracted but not preloaded; {@code available} is
+     * only set for {@code loadAtStartup} libraries, so check the extracted path instead.
+     */
+    public static boolean xellAvailable() {
+        return LIB_SUPER_RESOLUTION_XELL != null
+                && LIB_SUPER_RESOLUTION_XELL.extractedPath != null;
     }
 
     public static void createLibraryDir(Path path) {
