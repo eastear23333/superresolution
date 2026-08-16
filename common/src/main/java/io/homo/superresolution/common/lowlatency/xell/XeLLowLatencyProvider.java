@@ -13,6 +13,7 @@ package io.homo.superresolution.common.lowlatency.xell;
 import io.homo.superresolution.api.registry.LowLatencyMarker;
 import io.homo.superresolution.api.registry.LowLatencyProvider;
 import io.homo.superresolution.common.SuperResolution;
+import io.homo.superresolution.common.framegeneration.D3D12FrameGeneration;
 import io.homo.superresolution.common.lowlatency.LowLatency;
 import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.core.NativeLibManager;
@@ -201,6 +202,12 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
 
     @Override
     public void release() {
+        // XeSS-FG must be torn down before the XeLL context dies: its proxy Present uses
+        // the connected XeLL context (and this shared libxell.dll) even in passthrough
+        // mode, so destroying XeLL underneath a live takeover crashes the next Present
+        // (DEP violation; the XeSS-FG guide requires XeFG destroy before XeLL destroy).
+        // No-op when no takeover is active; idempotent for the game-shutdown path.
+        D3D12FrameGeneration.teardownForLowLatencyShutdown();
         if (context != null && context.address() != 0L && destroyContext != null) {
             try {
                 int result = (int) destroyContext.invokeExact(context);

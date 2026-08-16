@@ -63,6 +63,19 @@ public final class D3D12PresentationContext implements AutoCloseable {
             FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT);
     private static final MethodHandle PRESENT_DOWN = NATIVE_LINKER.downcallHandle(PRESENT_DESC);
     private static volatile long cachedXefgPresentFn;
+    /** kernel32 event waits used for the flipY fence instead of 1ms polling. */
+    private static final MethodHandle CREATE_EVENT = NATIVE_LINKER.defaultLookup()
+            .find("CreateEventW").map(sym -> NATIVE_LINKER.downcallHandle(
+                    sym, FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS)))
+            .orElse(null);
+    private static final MethodHandle WAIT_SINGLE_OBJECT = NATIVE_LINKER.defaultLookup()
+            .find("WaitForSingleObject").map(sym -> NATIVE_LINKER.downcallHandle(
+                    sym, FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT)))
+            .orElse(null);
+    private static final MethodHandle CLOSE_HANDLE = NATIVE_LINKER.defaultLookup()
+            .find("CloseHandle").map(sym -> NATIVE_LINKER.downcallHandle(
+                    sym, FunctionDescriptor.of(JAVA_INT, ADDRESS)))
+            .orElse(null);
 
     private final Arena arena;
     private final long hwnd;
@@ -85,6 +98,10 @@ public final class D3D12PresentationContext implements AutoCloseable {
     private long mvAllocationSize;
     private GlD3D12ImportableTexture2D mvGlTexture;
     private final D3D12InteropSemaphore semaphore;
+    /** Back buffers cached per swap-chain index (one COM reference each), avoiding a GetBuffer/Release pair every present. */
+    private final MemorySegment[] backBuffers = new MemorySegment[8];
+    /** Auto-reset kernel event for the flipY fence wait; created lazily. */
+    private MemorySegment fenceEvent = MemorySegment.NULL;
     private int width;
     private int height;
     private long nextGlFence = 1;
@@ -474,117 +491,209 @@ public final class D3D12PresentationContext implements AutoCloseable {
                     new int[]{GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT});
         }
 
-        windows.win32.graphics.direct3d12.ID3D12CommandQueue queueIface =
-                windows.win32.graphics.direct3d12.ID3D12CommandQueue.wrap(queue);
-        windows.win32.graphics.direct3d12.ID3D12Fence fenceIface =
-                windows.win32.graphics.direct3d12.ID3D12Fence.wrap(fence);
-        windows.win32.graphics.dxgi.IDXGISwapChain3 swapchainIface =
-                windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain);
-        windows.win32.graphics.direct3d12.ID3D12CommandAllocator allocatorIface =
-                windows.win32.graphics.direct3d12.ID3D12CommandAllocator.wrap(commandAllocator);
-        windows.win32.graphics.direct3d12.ID3D12GraphicsCommandList listIface =
-                windows.win32.graphics.direct3d12.ID3D12GraphicsCommandList.wrap(commandList);
+        // Per-frame segments (barriers, copy locations, event) live in a confined arena:
+        // allocating them on the context-lifetime arena accumulated memory every present.
+        try (Arena frameArena = Arena.ofConfined()) {
+            windows.win32.graphics.direct3d12.ID3D12CommandQueue queueIface =
+                    windows.win32.graphics.direct3d12.ID3D12CommandQueue.wrap(queue);
+            windows.win32.graphics.direct3d12.ID3D12Fence fenceIface =
+                    windows.win32.graphics.direct3d12.ID3D12Fence.wrap(fence);
+            windows.win32.graphics.dxgi.IDXGISwapChain3 swapchainIface =
+                    windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain);
 
-        queueIface.Wait(fence, captureValue);
+            queueIface.Wait(fence, captureValue);
 
-        checkHr(allocatorIface.Reset());
-        checkHr(listIface.Reset(commandAllocator, MemorySegment.NULL));
+            checkHr(windows.win32.graphics.direct3d12.ID3D12CommandAllocator.wrap(commandAllocator)
+                    .Reset());
+            checkHr(windows.win32.graphics.direct3d12.ID3D12GraphicsCommandList.wrap(commandList)
+                    .Reset(commandAllocator, MemorySegment.NULL));
 
-        int imageIndex = swapchainIface.GetCurrentBackBufferIndex();
-        MemorySegment ppBackBuffer = arena.allocate(ADDRESS);
+            int imageIndex = swapchainIface.GetCurrentBackBufferIndex();
+            MemorySegment backBuffer = cachedBackBuffer(frameArena, swapchainIface, imageIndex);
+
+            MemorySegment barriers = frameArena.allocate(
+                    windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.layout(), 2);
+            MemorySegment b0 = barriers;
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.Type(
+                    b0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER_TYPE.TRANSITION);
+            MemorySegment t0 = windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.Transition(b0);
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.pResource(t0, captureTexture);
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
+                    t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COMMON);
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
+                    t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_SOURCE);
+            MemorySegment b1 = barriers.asSlice(
+                    windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.layout().byteSize());
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.Type(
+                    b1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER_TYPE.TRANSITION);
+            MemorySegment t1 = windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.Transition(b1);
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.pResource(t1, backBuffer);
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
+                    t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COMMON);
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
+                    t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_DEST);
+            listIface().ResourceBarrier(2, barriers);
+
+            MemorySegment dst = frameArena.allocate(
+                    windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.layout());
+            windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.pResource(dst, backBuffer);
+            windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.Type(
+                    dst, windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_TYPE.SUBRESOURCE_INDEX);
+            windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.SubresourceIndex(dst, 0);
+            MemorySegment src = frameArena.allocate(
+                    windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.layout());
+            windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.pResource(src, captureTexture);
+            windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.Type(
+                    src, windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_TYPE.SUBRESOURCE_INDEX);
+            windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.SubresourceIndex(src, 0);
+            MemorySegment srcBox = frameArena.allocate(windows.win32.graphics.direct3d12.D3D12_BOX.layout());
+            windows.win32.graphics.direct3d12.D3D12_BOX.left(srcBox, 0);
+            windows.win32.graphics.direct3d12.D3D12_BOX.top(srcBox, 0);
+            windows.win32.graphics.direct3d12.D3D12_BOX.front(srcBox, 0);
+            windows.win32.graphics.direct3d12.D3D12_BOX.right(srcBox, width);
+            windows.win32.graphics.direct3d12.D3D12_BOX.bottom(srcBox, height);
+            windows.win32.graphics.direct3d12.D3D12_BOX.back(srcBox, 1);
+            listIface().CopyTextureRegion(dst, 0, 0, 0, src, srcBox);
+
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
+                    t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_DEST);
+            // Return the back buffer to PRESENT state (not COMMON) before Present: the XeSS-FG
+            // proxy tracks the back-buffer state and expects PRESENT for a presented buffer.
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
+                    t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_PRESENT);
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
+                    t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_SOURCE);
+            windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
+                    t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COMMON);
+            // Depth/mv are intentionally absent from these barriers: shared
+            // (simultaneous-access) textures are never transitioned on this side; they sit
+            // in COMMON for the SDK's Present-time lists (they decay at every ECL
+            // completion, so an SRV declaration removes the device — 0x887a0001).
+            listIface().ResourceBarrier(2, barriers);
+
+            checkHr(listIface().Close());
+            queueIface.ExecuteCommandLists(1, frameArena.allocateFrom(ADDRESS, commandList));
+
+            // Wait until the GL flipY has actually completed on the GPU (fence >= captureValue)
+            // before presenting; presenting through this same queue is FIFO-ordered after the
+            // copy, this wait guards the frame pacing of the Present call itself. Event-based
+            // (no 1ms polling); falls back to polling when kernel32 is not bindable.
+            waitForFlipY(fenceIface, captureValue);
+
+            // Stamp the present latency markers. The Vulkan swapchain does this in its own
+            // present path; the D3D12 presentation has no equivalent hook, so do it here for
+            // the XeLL low-latency provider (present-start/end frame the swapchain Present).
+            LowLatency.beginPresent();
+            // If XeSS-FG took over the swap chain, tag constants and set the present id right
+            // before Present so the proxy can generate interpolated frames.
+            D3D12FrameGeneration.beforePresent();
+            int presentResult = presentSwapchain(swapchain, vsync);
+            if (presentResult != 0) {
+                io.homo.superresolution.common.SuperResolution.LOGGER.warn(
+                        "[D3D12] present result=0x{}", Integer.toHexString(presentResult));
+            } else {
+                io.homo.superresolution.common.SuperResolution.LOGGER.debug("[D3D12] present ok");
+            }
+            LowLatency.endPresent();
+
+            long signalValue = nextGlFence + 1;
+            queueIface.Signal(fence, signalValue);
+            lastD3d12Signal = signalValue;
+            nextGlFence += 2;
+        }
+    }
+
+    /** The context's single resettable graphics command list. */
+    private windows.win32.graphics.direct3d12.ID3D12GraphicsCommandList listIface() {
+        return windows.win32.graphics.direct3d12.ID3D12GraphicsCommandList.wrap(commandList);
+    }
+
+    /**
+     * Returns the swap-chain back buffer for {@code index}, cached (the cached reference is
+     * held until the swap chain changes; the flip model guarantees at most bufferCount
+     * distinct indices).
+     */
+    private MemorySegment cachedBackBuffer(
+            Arena frameArena,
+            windows.win32.graphics.dxgi.IDXGISwapChain3 swapchainIface,
+            int index) {
+        if (index >= 0 && index < backBuffers.length && backBuffers[index] != null
+                && backBuffers[index].address() != 0L) {
+            return backBuffers[index];
+        }
+        MemorySegment ppBackBuffer = frameArena.allocate(ADDRESS);
         checkHr(swapchainIface.GetBuffer(
-                imageIndex, windows.win32.graphics.direct3d12.ID3D12Resource.iid(), ppBackBuffer));
+                index, windows.win32.graphics.direct3d12.ID3D12Resource.iid(), ppBackBuffer));
         MemorySegment backBuffer = ppBackBuffer.get(ADDRESS, 0);
+        // Store the pointer in the context-lifetime arena so the cache outlives the frame
+        // arena; the cached COM reference is released with the cache.
+        MemorySegment cached = arena.allocate(ADDRESS);
+        cached.set(ADDRESS, 0, backBuffer);
+        if (index >= 0 && index < backBuffers.length) {
+            backBuffers[index] = cached.get(ADDRESS, 0);
+        }
+        return backBuffer;
+    }
 
-        // Only the capture texture and back buffer are transitioned here. The depth/mv
-        // XeSS-FG inputs are shared (simultaneous-access) textures: they decay to COMMON
-        // at every ExecuteCommandLists completion, so a transition in this list cannot
-        // carry over to the SDK's own lists submitted during Present (a separate ECL).
-        // They are therefore tagged with incomingState COMMON and the SDK handles the
-        // transitions itself; an SRV declaration removes the device (0x887a0001).
-        MemorySegment barriers = arena.allocate(
-                windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.layout(), 2);
-        MemorySegment b0 = barriers;
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.Type(
-                b0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER_TYPE.TRANSITION);
-        MemorySegment t0 = windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.Transition(b0);
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.pResource(t0, captureTexture);
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
-                t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COMMON);
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
-                t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_SOURCE);
-        MemorySegment b1 = barriers.asSlice(
-                windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.layout().byteSize());
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.Type(
-                b1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER_TYPE.TRANSITION);
-        MemorySegment t1 = windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.Transition(b1);
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.pResource(t1, backBuffer);
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
-                t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COMMON);
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
-                t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_DEST);
-        listIface.ResourceBarrier(2, barriers);
+    /** Releases all cached back-buffer references (swap chain changed / shutdown). */
+    private void releaseBackBuffers() {
+        for (int i = 0; i < backBuffers.length; i++) {
+            if (backBuffers[i] != null && backBuffers[i].address() != 0L) {
+                windows.win32.graphics.direct3d12.ID3D12Resource.wrap(backBuffers[i]).Release();
+                backBuffers[i] = MemorySegment.NULL;
+            }
+        }
+    }
 
-        MemorySegment dst = arena.allocate(
-                windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.layout());
-        windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.pResource(dst, backBuffer);
-        windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.Type(
-                dst, windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_TYPE.SUBRESOURCE_INDEX);
-        windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.SubresourceIndex(dst, 0);
-        MemorySegment src = arena.allocate(
-                windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.layout());
-        windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.pResource(src, captureTexture);
-        windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.Type(
-                src, windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_TYPE.SUBRESOURCE_INDEX);
-        windows.win32.graphics.direct3d12.D3D12_TEXTURE_COPY_LOCATION.SubresourceIndex(src, 0);
-        MemorySegment srcBox = arena.allocate(windows.win32.graphics.direct3d12.D3D12_BOX.layout());
-        windows.win32.graphics.direct3d12.D3D12_BOX.left(srcBox, 0);
-        windows.win32.graphics.direct3d12.D3D12_BOX.top(srcBox, 0);
-        windows.win32.graphics.direct3d12.D3D12_BOX.front(srcBox, 0);
-        windows.win32.graphics.direct3d12.D3D12_BOX.right(srcBox, width);
-        windows.win32.graphics.direct3d12.D3D12_BOX.bottom(srcBox, height);
-        windows.win32.graphics.direct3d12.D3D12_BOX.back(srcBox, 1);
-        listIface.CopyTextureRegion(dst, 0, 0, 0, src, srcBox);
+    /**
+     * Blocks until {@code fenceIface} reaches {@code captureValue} (bounded ~2s) using the
+     * fence completion event, falling back to polling when kernel32 cannot be bound. Logs a
+     * warning (and reports device removal) on timeout.
+     */
+    private void waitForFlipY(windows.win32.graphics.direct3d12.ID3D12Fence fenceIface, long captureValue) {
+        if (fenceIface.GetCompletedValue() >= captureValue) {
+            return;
+        }
+        if (CREATE_EVENT != null && WAIT_SINGLE_OBJECT != null && ensureFenceEvent()) {
+            try {
+                checkHr(fenceIface.SetEventOnCompletion(captureValue, fenceEvent));
+                // Bounded like the old polling loop; the auto-reset event covers retries.
+                long deadline = System.nanoTime() + 2_000_000_000L;
+                while (fenceIface.GetCompletedValue() < captureValue
+                        && System.nanoTime() < deadline) {
+                    // remaining ms, at least 1
+                    int remaining = (int) Math.max(1,
+                            (deadline - System.nanoTime()) / 1_000_000L);
+                    WAIT_SINGLE_OBJECT.invokeExact(fenceEvent, (int) remaining);
+                }
+            } catch (Throwable throwable) {
+                io.homo.superresolution.common.SuperResolution.LOGGER.debug(
+                        "[D3D12] fence event wait failed; polling", throwable);
+                pollFlipY(fenceIface, captureValue);
+            }
+        } else {
+            pollFlipY(fenceIface, captureValue);
+        }
+        reportFlipYTimeout(fenceIface, captureValue);
+    }
 
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
-                t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_DEST);
-        // Return the back buffer to PRESENT state (not COMMON) before Present: the XeSS-FG
-        // proxy tracks the back-buffer state and expects PRESENT for a presented buffer.
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
-                t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_PRESENT);
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
-                t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_SOURCE);
-        windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
-                t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COMMON);
-        // Depth/mv are intentionally absent from the trailing barriers too: shared
-        // (simultaneous-access) textures are never transitioned on this side; they sit in
-        // COMMON for the SDK's Present-time lists (see the comment above the barriers).
-        listIface.ResourceBarrier(2, barriers);
-
-        checkHr(listIface.Close());
-        queueIface.ExecuteCommandLists(1, arena.allocateFrom(ADDRESS, commandList));
-
-        // GetBuffer above added a reference to the back buffer; the copy is now submitted,
-        // so release it. Not releasing leaks one back buffer reference per present, which
-        // makes ResizeBuffers fail with DXGI_ERROR_INVALID_CALL (and, when a DLL like
-        // OptiScaler wraps the swap chain, leaves the window's flip-model swap chain alive
-        // so recreate also fails with E_ACCESSDENIED).
-        windows.win32.graphics.direct3d12.ID3D12Resource.wrap(backBuffer).Release();
-
-        // Wait until the GL flipY has actually completed on the GPU (fence >= captureValue)
-        // before presenting. Without this the D3D12 copy can race ahead of flipY and the
-        // presented back buffer shows an earlier frame ("rolling back to a previous frame").
+    private void pollFlipY(
+            windows.win32.graphics.direct3d12.ID3D12Fence fenceIface, long captureValue) {
         for (int i = 0; i < 2000; i++) {
             if (fenceIface.GetCompletedValue() >= captureValue) {
-                break;
+                return;
             }
             try {
                 Thread.sleep(1);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                break;
+                return;
             }
         }
+    }
+
+    private void reportFlipYTimeout(
+            windows.win32.graphics.direct3d12.ID3D12Fence fenceIface, long captureValue) {
         long completedAfterWait = fenceIface.GetCompletedValue();
         if (completedAfterWait < captureValue) {
             io.homo.superresolution.common.SuperResolution.LOGGER.warn(
@@ -603,41 +712,24 @@ public final class D3D12PresentationContext implements AutoCloseable {
                         + Integer.toHexString(removalReason) + ")");
             }
         }
+    }
 
-        // Stamp the present latency markers. The Vulkan swapchain does this in its own
-        // present path; the D3D12 presentation has no equivalent hook, so do it here for
-        // the XeLL low-latency provider (present-start/end frame the swapchain Present).
-        LowLatency.beginPresent();
-        io.homo.superresolution.common.SuperResolution.LOGGER.info(
-                "[D3D12] present: swapchain=0x{} vsync={}", Long.toHexString(swapchain.address()), vsync);
-        // Diagnose the Present vtable slot (8). The cached function pointer is captured on
-        // XeSS-FG takeover (capturePresentSlot), not here, so an ordinary swap chain's slot
-        // never leaks into the proxy present path.
-        long presentSlot = 0L;
-        try {
-            MemorySegment vtable = swapchain.reinterpret(ADDRESS.byteSize()).get(ADDRESS, 0);
-            presentSlot = vtable.reinterpret(ADDRESS.byteSize() * 12)
-                    .get(ADDRESS, ADDRESS.byteSize() * 8).address();
-            io.homo.superresolution.common.SuperResolution.LOGGER.info(
-                    "[D3D12] present vtable: vtable=0x{} slot8=0x{} cache=0x{}",
-                    Long.toHexString(vtable.address()), Long.toHexString(presentSlot),
-                    Long.toHexString(cachedXefgPresentFn));
-        } catch (Throwable throwable) {
-            io.homo.superresolution.common.SuperResolution.LOGGER.warn(
-                    "[D3D12] vtable read failed", throwable);
+    private boolean ensureFenceEvent() {
+        if (fenceEvent.address() != 0L) {
+            return true;
         }
-        // If XeSS-FG took over the swap chain, tag constants and set the present id right
-        // before Present so the proxy can generate interpolated frames.
-        D3D12FrameGeneration.beforePresent();
-        int presentResult = presentSwapchain(swapchain, vsync);
-        io.homo.superresolution.common.SuperResolution.LOGGER.info(
-                "[D3D12] present result=0x{}", Integer.toHexString(presentResult));
-        LowLatency.endPresent();
-
-        long signalValue = nextGlFence + 1;
-        queueIface.Signal(fence, signalValue);
-        lastD3d12Signal = signalValue;
-        nextGlFence += 2;
+        try {
+            MemorySegment event = (MemorySegment) CREATE_EVENT.invokeExact(
+                    MemorySegment.NULL, 0, 0, MemorySegment.NULL);
+            if (event.address() != 0L) {
+                fenceEvent = event;
+                return true;
+            }
+        } catch (Throwable throwable) {
+            io.homo.superresolution.common.SuperResolution.LOGGER.debug(
+                    "[D3D12] CreateEventW failed", throwable);
+        }
+        return false;
     }
 
     /** Clears the cached Present slot (e.g. when the XeSS-FG proxy is torn down). */
@@ -719,6 +811,8 @@ public final class D3D12PresentationContext implements AutoCloseable {
         // over a longer window, then fall back to recreating the swap chain like the
         // reference Vulkan surface does.
         waitForGpu();
+        // ResizeBuffers re-creates the back buffers, so cached references must go first.
+        releaseBackBuffers();
         windows.win32.graphics.dxgi.IDXGISwapChain3 swapchainIface =
                 windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain);
         int lastHr = 0;
@@ -763,6 +857,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
 
     /** Releases the swap chain so the XeSS-FG SDK can create its own on the window. */
     public void releaseSwapchain() {
+        releaseBackBuffers();
         if (swapchain != null && swapchain.address() != 0L) {
             windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain).Release();
             swapchain = MemorySegment.NULL;
@@ -773,6 +868,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
     public void recreateSwapchain(int newWidth, int newHeight) {
         // A window may only own one flip-model swap chain, so release the old one
         // before creating a replacement (otherwise CreateSwapChainForHwnd fails).
+        releaseBackBuffers();
         if (swapchain.address() != 0) {
             windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain).Release();
         }
@@ -904,6 +1000,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
 
     /** Replaces the swap chain, e.g. with the XeSS-FG proxy swap chain. */
     public void setSwapchain(MemorySegment swapchain) {
+        releaseBackBuffers();
         this.swapchain = swapchain;
     }
 
@@ -935,6 +1032,16 @@ public final class D3D12PresentationContext implements AutoCloseable {
 
     @Override
     public void close() {
+        releaseBackBuffers();
+        if (fenceEvent.address() != 0L && CLOSE_HANDLE != null) {
+            try {
+                CLOSE_HANDLE.invokeExact(fenceEvent);
+            } catch (Throwable throwable) {
+                io.homo.superresolution.common.SuperResolution.LOGGER.debug(
+                        "[D3D12] fence event close failed", throwable);
+            }
+            fenceEvent = MemorySegment.NULL;
+        }
         arena.close();
     }
 

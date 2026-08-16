@@ -70,6 +70,17 @@ public final class D3D12FrameGeneration {
     private static boolean eventRegistered;
     private static ITexture cachedDepth;
     private static ITexture cachedMotionVector;
+    /** Last frame time delta from the dispatch event, passed as frameRenderTime (ms). */
+    private static float cachedFrameTimeDelta;
+    /** Last multiplier pushed to the provider; re-synced from the config each present. */
+    private static int appliedInterpolatedFrames = -1;
+    /** Presentation extent last pushed to the provider's tagged resource size. */
+    private static int reportedWidth = -1;
+    private static int reportedHeight = -1;
+    /** Camera discontinuity detection inputs for resetHistory (position/dimension/fov). */
+    private static Vector3d lastCameraPosition;
+    private static float lastCameraFov = Float.NEGATIVE_INFINITY;
+    private static boolean lastCameraStateValid;
     /**
      * Monotonically increasing present id for XeSS-FG resource tagging. OptiScaler tags
      * each frame with an internal per-present counter; the XeLL latency frame id is not
@@ -88,16 +99,23 @@ public final class D3D12FrameGeneration {
         eventRegistered = true;
     }
 
-    /** Caches the Iris depth/motion-vector GL textures for the next present. */
+    /** Caches the Iris depth/motion-vector GL textures and frame time for the next present. */
     private static void onAlgorithmDispatch(AlgorithmDispatchEvent event) {
         if (event == null || event.getDispatchResource() == null) {
             return;
         }
         InputResourceSet resources = event.getDispatchResource().resources();
+        boolean depthPresent = resources.depthTexture() != null;
+        boolean mvPresent = resources.motionVectorsTexture() != null;
+        boolean inputsChanged = (cachedDepth != null) != depthPresent
+                || (cachedMotionVector != null) != mvPresent;
         cachedDepth = resources.depthTexture();
         cachedMotionVector = resources.motionVectorsTexture();
-        SuperResolution.LOGGER.info("[D3D12] XeSS-FG dispatch: depth={} motionVector={}",
-                cachedDepth != null, cachedMotionVector != null);
+        cachedFrameTimeDelta = event.getDispatchResource().frameTimeDelta();
+        if (inputsChanged) {
+            SuperResolution.LOGGER.info("[D3D12] XeSS-FG dispatch: depth={} motionVector={}",
+                    depthPresent, mvPresent);
+        }
     }
 
     /**
@@ -163,6 +181,11 @@ public final class D3D12FrameGeneration {
         if (proxy != 0L) {
             presentation.setSwapchain(MemorySegment.ofAddress(proxy));
             provider = d3d12Provider;
+            // Force the next beforePresent to re-sync the multiplier and tagged extent.
+            appliedInterpolatedFrames = -1;
+            reportedWidth = -1;
+            reportedHeight = -1;
+            lastCameraStateValid = false;
             // Keep enabled=false: XeSS-FG starts disabled and is only enabled once a frame
             // actually provides depth/motion vectors (beforePresent). Marking it enabled
             // here made the first input-less frame think interpolation was on and call
@@ -208,36 +231,88 @@ public final class D3D12FrameGeneration {
         // Own per-present counter for the XeSS-FG frame id (see field docs).
         int xefgFrameId = (int) (xefgPresentCounter++ & 0xFFFFFFFFL);
         try {
-            boolean hasInputs = cachedDepth != null && cachedMotionVector != null && presentation != null;
+            syncConfiguredState(active);
+            FrameGenerationMode mode = FrameGeneration.displayedMode();
+            boolean hasInputs = mode.isEnabled() && cachedDepth != null
+                    && cachedMotionVector != null && presentation != null;
             if (hasInputs) {
-                // Only tag constants/resources (and enable interpolation) once both depth
-                // and motion vectors are available for this frame. OptiScaler never calls
-                // SetPresentId/TagFrameConstants while XeSS-FG is disabled or inputs are
-                // missing; doing so crashes the proxy Present in native code.
+                // Only tag constants/resources (and enable interpolation) once frame
+                // generation is configured on and both depth and motion vectors are
+                // available for this frame; OptiScaler never tags a disabled/inputless
+                // frame (it crashes the proxy Present in native code).
                 if (!enabled) {
                     active.setEnabled(true);
                     enabled = true;
+                    SuperResolution.LOGGER.info("[D3D12] XeSS-FG interpolation enabled");
                 }
-                SuperResolution.LOGGER.info("[D3D12] XeSS-FG tag frame {} (enabled={})",
+                SuperResolution.LOGGER.debug("[D3D12] XeSS-FG tag frame {} (enabled={})",
                         xefgFrameId, enabled);
                 active.prepareD3D12Present(
                         xefgFrameId, viewMatrix(), projectionMatrix(),
-                        0.0f, 0.0f, 1.0f, 1.0f, false,
+                        0.0f, 0.0f, 1.0f, 1.0f,
+                        cameraDiscontinuity(), cachedFrameTimeDelta,
                         presentation.depthTexture().address(),
                         presentation.mvTexture().address());
             } else if (enabled) {
-                // The depth/motion-vector stream dropped (e.g. a menu/pause covers the
-                // scene); disable interpolation so the next Present is a plain passthrough
-                // instead of a tagged-but-inputless frame.
-                SuperResolution.LOGGER.info("[D3D12] XeSS-FG inputs dropped, disabling");
+                // Frame generation was switched off, or the depth/motion-vector stream
+                // dropped (e.g. a menu/pause covers the scene); disable interpolation so
+                // the next Present is a plain passthrough instead of an inputless tag.
+                SuperResolution.LOGGER.info(
+                        "[D3D12] XeSS-FG disabling (mode={}, depth={}, mv={})",
+                        mode, cachedDepth != null, cachedMotionVector != null);
                 active.setEnabled(false);
                 enabled = false;
-            } else {
-                SuperResolution.LOGGER.info("[D3D12] XeSS-FG passthrough (no inputs)");
             }
         } catch (Throwable throwable) {
             SuperResolution.LOGGER.warn("[D3D12] XeSS-FG preparePresent failed", throwable);
         }
+    }
+
+    /**
+     * Pushes the configured frame-generation mode's multiplier and the presentation extent
+     * to the provider when they change. Runs every present; both checks are cheap
+     * comparisons once synced.
+     */
+    private static void syncConfiguredState(D3D12FrameGenerationProvider active) {
+        if (presentation == null) {
+            return;
+        }
+        int interpolatedFrames;
+        FrameGenerationMode mode = FrameGeneration.displayedMode();
+        interpolatedFrames = mode.isEnabled() ? Math.max(1, mode.generatedFrameCount()) : 1;
+        if (interpolatedFrames != appliedInterpolatedFrames) {
+            appliedInterpolatedFrames = interpolatedFrames;
+            SuperResolution.LOGGER.info(
+                    "[D3D12] XeSS-FG interpolated frames per present: {}", interpolatedFrames);
+            active.setNumInterpolatedFrames(interpolatedFrames);
+        }
+        if (presentation.width() != reportedWidth || presentation.height() != reportedHeight) {
+            reportedWidth = presentation.width();
+            reportedHeight = presentation.height();
+            active.updateResourceExtent(reportedWidth, reportedHeight);
+        }
+    }
+
+    /**
+     * Detects camera discontinuities (teleport/large jump/FOV change) so the frame tag can
+     * reset XeSS-FG's interpolation history for one frame, preventing ghost trails after
+     * camera cuts.
+     */
+    private static boolean cameraDiscontinuity() {
+        Camera camera = Minecraft.getInstance().gameRenderer.getMainCamera();
+        #if MC_VER >= MC_1_21_11
+        Vector3d position = new Vector3d(camera.position().x, camera.position().y, camera.position().z);
+        #else
+        Vector3d position = new Vector3d(camera.getPosition().x, camera.getPosition().y, camera.getPosition().z);
+        #endif
+        float fov = MinecraftCameraState.fov;
+        boolean discontinuity = lastCameraStateValid
+                && (lastCameraPosition.distanceSquared(position) > 64.0
+                || Math.abs(lastCameraFov - fov) > 1.0f);
+        lastCameraPosition = position;
+        lastCameraFov = fov;
+        lastCameraStateValid = true;
+        return discontinuity;
     }
 
     /**
@@ -288,6 +363,15 @@ public final class D3D12FrameGeneration {
     /** Tears down the provider and restores the presentation swap chain. */
     public static synchronized void shutdown() {
         if (provider != null) {
+            // Disable interpolation before destroying the context (cheap insurance for a
+            // mid-game teardown while frames are still being tagged).
+            if (enabled) {
+                try {
+                    provider.setEnabled(false);
+                } catch (Throwable throwable) {
+                    SuperResolution.LOGGER.debug("[D3D12] XeSS-FG disable on shutdown failed", throwable);
+                }
+            }
             // Drop our reference to the proxy swap chain first: the SDK refuses
             // xefgSwapChainDestroy with -19 (POINTER_STILL_IN_USE) while any proxy
             // reference is alive, and the presentation holds the one returned by
@@ -303,10 +387,46 @@ public final class D3D12FrameGeneration {
             }
             provider = null;
             enabled = false;
+            appliedInterpolatedFrames = -1;
+            reportedWidth = -1;
+            reportedHeight = -1;
         }
         presentation = null;
         cachedDepth = null;
         cachedMotionVector = null;
+        cachedFrameTimeDelta = 0.0f;
+        lastCameraStateValid = false;
+    }
+
+    /**
+     * Tears the XeSS-FG takeover down mid-game and restores a plain presentation swap
+     * chain. Called right before the XeLL context is destroyed: the proxy Present uses
+     * the connected XeLL context (and the shared libxell.dll) even in passthrough mode
+     * (frame-generation mode OFF only disables interpolation), so destroying XeLL
+     * underneath a live XeSS-FG context crashes the next Present with a DEP violation
+     * (the XeSS-FG guide requires destroying XeFG before XeLL). The takeover comes back
+     * automatically once a new XeLL context exists.
+     */
+    public static synchronized void teardownForLowLatencyShutdown() {
+        D3D12PresentationContext presentationContext = presentation;
+        if (presentationContext == null || provider == null) {
+            return;
+        }
+        shutdown();
+        try {
+            presentationContext.recreateSwapchain(
+                    presentationContext.width(), presentationContext.height());
+            // Keep the presentation and arm the deferred retry so the takeover resumes
+            // when a new XeLL context appears (XeLL re-enabled).
+            presentation = presentationContext;
+            pendingInit = true;
+            SuperResolution.LOGGER.info(
+                    "[D3D12] XeSS-FG torn down before XeLL shutdown; swap chain restored");
+        } catch (Throwable throwable) {
+            SuperResolution.LOGGER.error(
+                    "[D3D12] XeSS-FG teardown swap chain restore failed", throwable);
+            D3D12PresentationFeature.disableAfterFailure(throwable);
+        }
     }
 
     /** Row-major view matrix rebuilt from the Minecraft camera basis vectors. */

@@ -13,6 +13,7 @@ package io.homo.superresolution.common.framegeneration;
 import io.homo.superresolution.api.registry.BackendGroup;
 import io.homo.superresolution.api.registry.AsyncFrameGenerationDispatchRequest;
 import io.homo.superresolution.api.registry.AsyncFrameGenerationDispatchResult;
+import io.homo.superresolution.api.registry.D3D12FrameGenerationProvider;
 import io.homo.superresolution.api.registry.FrameGenerationDescription;
 import io.homo.superresolution.api.registry.FrameGenerationExecutionModel;
 import io.homo.superresolution.api.registry.FrameGenerationProvider;
@@ -25,6 +26,7 @@ import io.homo.superresolution.common.framegeneration.constants.FGConstants;
 import io.homo.superresolution.common.framegeneration.constants.FGConstantsFeature;
 import io.homo.superresolution.common.lowlatency.LowLatency;
 import io.homo.superresolution.common.presentation.capture.FrameResources;
+import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;
 import io.homo.superresolution.common.workmode.SRWorkModeManager;
 import io.homo.superresolution.common.workmode.SRWorkModeState;
@@ -62,6 +64,9 @@ public final class FrameGeneration {
     private static @Nullable String startupPreferredFgBackendId;
     private static @Nullable String loggedAsyncCapabilityFailure;
     private static boolean initialized;
+    /** Cache for {@link #d3d12ConfiguredProvider()}, keyed by the configured provider id. */
+    private static String cachedD3d12ProviderKey = "";
+    private static @Nullable D3D12FrameGenerationProvider cachedD3d12Provider;
 
     static {
         FrameGenerationDescriptions.register();
@@ -595,22 +600,81 @@ public final class FrameGeneration {
     }
 
     private static boolean backendAvailable() {
-        FrameGenerationProvider provider = activeProvider();
+        FrameGenerationProvider provider = uiCapabilityProvider();
         return provider != null && provider.isAvailable();
     }
 
     private static int supportedGeneratedFrameCount() {
-        FrameGenerationProvider provider = activeProvider();
+        FrameGenerationProvider provider = uiCapabilityProvider();
         return provider == null ? 0 : provider.supportedGeneratedFrameCount();
     }
 
     static boolean dependenciesSatisfied() {
+        if (D3D12PresentationFeature.isInitialized()) {
+            // The D3D12 presentation excludes the Vulkan swap-chain path (and with it the
+            // interop sync mode below): proxy providers like XeSS-FG gate on their own
+            // D3D12/XeLL dependencies instead.
+            FrameGenerationProvider provider = d3d12ConfiguredProvider();
+            return provider != null && provider.dependenciesSatisfied();
+        }
         if (!SuperResolutionConfig.isEnableVulkanPresentation()
                 || SuperResolutionConfig.getInteropSyncMode() != InteropSyncMode.LowLatency) {
             return false;
         }
         FrameGenerationProvider provider = activeProvider();
         return provider != null && provider.dependenciesSatisfied();
+    }
+
+    /**
+     * Provider consulted by the UI capability queries ({@link #isSupported()},
+     * {@link #availableModes()}): the negotiated Vulkan provider when that presentation is
+     * active, or the configured D3D12 proxy provider when the D3D12 presentation runs —
+     * the Vulkan negotiation never populates under D3D12, which kept the frame-generation
+     * mode selector permanently disabled for XeSS-FG.
+     */
+    private static FrameGenerationProvider uiCapabilityProvider() {
+        return D3D12PresentationFeature.isInitialized() ? d3d12ConfiguredProvider() : activeProvider();
+    }
+
+    /**
+     * Resolves the concrete {@link D3D12FrameGenerationProvider} matching the configured
+     * frame-generation group (e.g. XeSS-FG) from the registry, cached per configured id.
+     * The instance answers capability queries only; the live provider is created and
+     * driven by {@code D3D12FrameGeneration}.
+     */
+    private static @Nullable D3D12FrameGenerationProvider d3d12ConfiguredProvider() {
+        String configured = SuperResolutionConfig.getFrameGenerationProvider();
+        if (configured == null || configured.isBlank()) {
+            return null;
+        }
+        if (configured.equals(cachedD3d12ProviderKey)) {
+            return cachedD3d12Provider;
+        }
+        FrameGenerationDescription configuredDescription =
+                FrameGenerationRegistry.getDescriptionById(configured);
+        BackendGroup group = configuredDescription != null
+                ? configuredDescription.getGroup()
+                : null;
+        D3D12FrameGenerationProvider resolved = null;
+        if (group != null) {
+            for (FrameGenerationDescription description
+                    : FrameGenerationRegistry.getDescriptions().values()) {
+                if (description.isAutomatic()
+                        || description.getGroup() == null
+                        || !group.getId().equals(description.getGroup().getId())
+                        || !FrameGenerationRegistry.isSupported(description)) {
+                    continue;
+                }
+                FrameGenerationProvider provider = description.createProvider();
+                if (provider instanceof D3D12FrameGenerationProvider d3d12) {
+                    resolved = d3d12;
+                    break;
+                }
+            }
+        }
+        cachedD3d12ProviderKey = configured;
+        cachedD3d12Provider = resolved;
+        return resolved;
     }
 
     // FG only under shader_compat + loaded pack; vanilla/hack breaks UI presentation

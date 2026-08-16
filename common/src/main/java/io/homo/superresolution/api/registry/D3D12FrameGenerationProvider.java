@@ -35,9 +35,9 @@ public interface D3D12FrameGenerationProvider extends FrameGenerationProvider {
      * Tag this frame's constants and depth/motion-vector resources and set the present
      * id. Called on the render thread right before the swap chain {@code Present}.
      * {@code viewMatrix}/{@code projectionMatrix} are 16-float row-major arrays without
-     * applied jitter; {@code depthResource}/{@code motionVectorResource} are
-     * {@code ID3D12Resource*} addresses on the presentation device, or 0 when not yet
-     * available.
+     * applied jitter; {@code frameRenderTimeMs} paces the interpolated frames;
+     * {@code depthResource}/{@code motionVectorResource} are {@code ID3D12Resource*}
+     * addresses on the presentation device, or 0 when not yet available.
      */
     void prepareD3D12Present(
             int presentId,
@@ -48,11 +48,28 @@ public interface D3D12FrameGenerationProvider extends FrameGenerationProvider {
             float motionVectorScaleX,
             float motionVectorScaleY,
             boolean resetHistory,
+            float frameRenderTimeMs,
             long depthResource,
             long motionVectorResource);
 
+    /**
+     * Updates the extent reported when tagging depth/motion-vector resources; called after
+     * the presentation (re)establishes its size so the tagged resource size never goes
+     * stale across a resize.
+     */
+    default void updateResourceExtent(int width, int height) {
+    }
+
     /** Enable or disable interpolation. */
     void setEnabled(boolean enabled);
+
+    /**
+     * Set how many interpolated frames the backend generates per presented frame
+     * (1 = 2x total). Called after a successful takeover and when the configured
+     * frame-generation mode changes; the backend clamps to its supported maximum.
+     */
+    default void setNumInterpolatedFrames(int interpolatedFrames) {
+    }
 
     /** Release the context and restore the presentation swap chain. */
     void shutdownD3D12();
