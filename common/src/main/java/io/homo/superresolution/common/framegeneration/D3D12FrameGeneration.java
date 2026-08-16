@@ -11,6 +11,9 @@
 package io.homo.superresolution.common.framegeneration;
 
 #if MC_VER >= MC_1_20_1 && MC_VER < MC_26_2
+import io.homo.superresolution.api.InputResourceSet;
+import io.homo.superresolution.api.SuperResolutionAPI;
+import io.homo.superresolution.api.event.AlgorithmDispatchEvent;
 import io.homo.superresolution.api.registry.D3D12FrameGenerationProvider;
 import io.homo.superresolution.api.registry.D3D12PresentationHandles;
 import io.homo.superresolution.api.registry.FrameGenerationDescription;
@@ -18,10 +21,12 @@ import io.homo.superresolution.api.registry.FrameGenerationRegistry;
 import io.homo.superresolution.common.SuperResolution;
 import io.homo.superresolution.common.config.SuperResolutionConfig;
 import io.homo.superresolution.common.framegeneration.constants.MinecraftCameraState;
-import io.homo.superresolution.common.lowlatency.LowLatency;
 import io.homo.superresolution.common.lowlatency.xell.XeLLowLatency;
 import io.homo.superresolution.common.minecraft.MinecraftUtils;
+import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
+import io.homo.superresolution.common.upscale.InteropResourcesConverter;
 import io.homo.superresolution.core.graphics.d3d12.D3D12PresentationContext;
+import io.homo.superresolution.core.graphics.impl.texture.ITexture;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import org.joml.Vector3d;
@@ -38,19 +43,58 @@ import java.lang.foreign.MemorySegment;
  * single registered {@link D3D12FrameGenerationProvider}: initialize it once the D3D12
  * presentation comes up (taking over the swap chain with the proxy), tag constants and
  * resources right before every Present, and tear it down with the presentation.</p>
+ *
+ * <p>Depth and motion vectors come from the shader-compat path: {@code IrisShaderCompatUpscaleDispatcher}
+ * publishes an {@link AlgorithmDispatchEvent} every frame carrying the Iris depth and
+ * velocity buffers; this class caches those GL textures and copies them into the D3D12
+ * presentation's shared depth/motion-vector textures (flipY / flipMotionVectorY) so
+ * XeSS-FG gets {@code ID3D12Resource*} inputs on the presentation device.</p>
  */
 public final class D3D12FrameGeneration {
     /** Wisteria's XeSS-FG backend id (registered through FrameGenerationRegisterEvent). */
     private static final String XEFG_BACKEND_ID = "wisteria:xefg";
     /** The XESS_FG group representative id, which the config stores when selected. */
     private static final String XESS_FG_GROUP_ID = "superresolution:xess_fg";
+    /**
+     * TEMP: XeSS-FG proxy swap-chain takeover is disabled pending a rework of the
+     * D3D12 present path against OptiScaler's FGPresent interception. The backend stays
+     * registered and selectable, but initialize() no longer releases the presentation
+     * swap chain nor swaps in the XeSS-FG proxy, so the D3D12 presentation runs stable.
+     * Re-enable once the proxy-Present crash is resolved.
+     */
+    private static final boolean XEFG_TAKEOVER_ENABLED = false;
 
     private static D3D12FrameGenerationProvider provider;
     private static boolean enabled;
     private static boolean pendingInit;
     private static D3D12PresentationContext presentation;
+    private static boolean eventRegistered;
+    private static ITexture cachedDepth;
+    private static ITexture cachedMotionVector;
 
     private D3D12FrameGeneration() {
+    }
+
+    private static void ensureEventRegistered() {
+        if (eventRegistered) {
+            return;
+        }
+        SuperResolutionAPI.EVENT_BUS.addListener(D3D12FrameGeneration::onAlgorithmDispatch);
+        eventRegistered = true;
+    }
+
+    /** Caches the Iris depth/motion-vector GL textures for the next present. */
+    private static void onAlgorithmDispatch(AlgorithmDispatchEvent event) {
+        if (event == null || event.getDispatchResource() == null) {
+            return;
+        }
+        InputResourceSet resources = event.getDispatchResource().resources();
+        cachedDepth = resources.depthTexture();
+        cachedMotionVector = resources.motionVectorsTexture();
+        if (cachedDepth == null || cachedMotionVector == null) {
+            SuperResolution.LOGGER.info("[D3D12] XeSS-FG dispatch: depth={} motionVector={}",
+                    cachedDepth != null, cachedMotionVector != null);
+        }
     }
 
     /**
@@ -73,6 +117,13 @@ public final class D3D12FrameGeneration {
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG skipped: configured provider='{}'", configured);
             return;
         }
+        if (!XEFG_TAKEOVER_ENABLED) {
+            pendingInit = false;
+            SuperResolution.LOGGER.info(
+                    "[D3D12] XeSS-FG is registered but disabled (takeover off pending rework); "
+                            + "D3D12 presentation runs stable");
+            return;
+        }
         if (XeLLowLatency.context().address() == 0L) {
             pendingInit = true;
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG deferred: XeLL context not ready");
@@ -92,6 +143,10 @@ public final class D3D12FrameGeneration {
             return;
         }
         pendingInit = false;
+        ensureEventRegistered();
+        // xefgSwapChainD3D12InitFromSwapChainDesc creates its own swap chain on the window,
+        // which requires the presentation's swap chain to be released first.
+        presentation.releaseSwapchain();
         D3D12PresentationHandles handles = new D3D12PresentationHandles(
                 presentation.device().address(),
                 presentation.queue().address(),
@@ -108,12 +163,21 @@ public final class D3D12FrameGeneration {
             enabled = true;
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG took over the swap chain (proxy={})",
                     Long.toHexString(proxy));
+        } else {
+            // Restore the presentation swap chain so rendering keeps working.
+            try {
+                presentation.recreateSwapchain(presentation.width(), presentation.height());
+            } catch (Throwable throwable) {
+                SuperResolution.LOGGER.error(
+                        "[D3D12] XeSS-FG init failed and swap chain restore failed", throwable);
+            }
+            SuperResolution.LOGGER.info("[D3D12] XeSS-FG initialization failed; swap chain restored");
         }
     }
 
     /**
-     * Tags this frame's constants and sets the present id on the provider. Called from the
-     * D3D12 present path right before the swap chain {@code Present}.
+     * Tags this frame's constants and resources and sets the present id on the provider.
+     * Called from the D3D12 present path right before the swap chain {@code Present}.
      */
     public static void beforePresent(int presentId) {
         // If initialization was deferred waiting for the XeLL context, retry now that the
@@ -127,12 +191,41 @@ public final class D3D12FrameGeneration {
             return;
         }
         try {
+            boolean hasInputs = cachedDepth != null && cachedMotionVector != null && presentation != null;
+            long depthResource = 0L;
+            long mvResource = 0L;
+            if (hasInputs) {
+                depthResource = presentation.depthTexture().address();
+                mvResource = presentation.mvTexture().address();
+            }
+            // XeSS-FG's proxy Present crashes in native code when enabled without
+            // depth/motion-vector inputs, so interpolation only runs when they are present.
+            if (hasInputs != enabled) {
+                active.setEnabled(hasInputs);
+                enabled = hasInputs;
+            }
             active.prepareD3D12Present(
                     presentId, viewMatrix(), projectionMatrix(),
                     0.0f, 0.0f, 1.0f, 1.0f, false,
-                    0L, 0L);
+                    depthResource, mvResource);
         } catch (Throwable throwable) {
             SuperResolution.LOGGER.warn("[D3D12] XeSS-FG preparePresent failed", throwable);
+        }
+    }
+
+    /**
+     * Copies the cached Iris depth/motion-vector GL textures into the D3D12 presentation's
+     * shared depth/motion-vector textures. Called from the D3D12 present path while
+     * recording the frame's GL work, so the copy lands before the shared-fence signal.
+     */
+    public static void writeFrameInputs(D3D12PresentationContext presentationContext) {
+        ITexture depth = cachedDepth;
+        ITexture mv = cachedMotionVector;
+        if (depth != null) {
+            InteropResourcesConverter.flipY(depth, presentationContext.depthGlTexture());
+        }
+        if (mv != null) {
+            InteropResourcesConverter.flipMotionVectorY(mv, presentationContext.mvGlTexture());
         }
     }
 
@@ -155,6 +248,9 @@ public final class D3D12FrameGeneration {
             provider = null;
             enabled = false;
         }
+        presentation = null;
+        cachedDepth = null;
+        cachedMotionVector = null;
     }
 
     /** Row-major view matrix rebuilt from the Minecraft camera basis vectors. */

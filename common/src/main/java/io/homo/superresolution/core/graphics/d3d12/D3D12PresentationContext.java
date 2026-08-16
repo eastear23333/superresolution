@@ -59,6 +59,13 @@ public final class D3D12PresentationContext implements AutoCloseable {
     private long captureAllocationSize;
 
     private GlD3D12ImportableTexture2D captureGlTexture;
+    /** R32_FLOAT depth and R16G16_FLOAT motion-vector textures for XeSS-FG, written from GL. */
+    private MemorySegment depthTexture;
+    private long depthAllocationSize;
+    private GlD3D12ImportableTexture2D depthGlTexture;
+    private MemorySegment mvTexture;
+    private long mvAllocationSize;
+    private GlD3D12ImportableTexture2D mvGlTexture;
     private final D3D12InteropSemaphore semaphore;
     private int width;
     private int height;
@@ -70,8 +77,10 @@ public final class D3D12PresentationContext implements AutoCloseable {
             Arena arena, long hwnd, MemorySegment device, MemorySegment queue, MemorySegment swapchain,
             MemorySegment factory, MemorySegment commandAllocator, MemorySegment commandList,
             MemorySegment fence, MemorySegment captureTexture, long captureAllocationSize,
-            GlD3D12ImportableTexture2D captureGlTexture, D3D12InteropSemaphore semaphore,
-            int width, int height) {
+            GlD3D12ImportableTexture2D captureGlTexture,
+            MemorySegment depthTexture, long depthAllocationSize, GlD3D12ImportableTexture2D depthGlTexture,
+            MemorySegment mvTexture, long mvAllocationSize, GlD3D12ImportableTexture2D mvGlTexture,
+            D3D12InteropSemaphore semaphore, int width, int height) {
         this.arena = arena;
         this.hwnd = hwnd;
         this.device = device;
@@ -84,6 +93,12 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.captureTexture = captureTexture;
         this.captureAllocationSize = captureAllocationSize;
         this.captureGlTexture = captureGlTexture;
+        this.depthTexture = depthTexture;
+        this.depthAllocationSize = depthAllocationSize;
+        this.depthGlTexture = depthGlTexture;
+        this.mvTexture = mvTexture;
+        this.mvAllocationSize = mvAllocationSize;
+        this.mvGlTexture = mvGlTexture;
         this.semaphore = semaphore;
         this.width = width;
         this.height = height;
@@ -173,7 +188,8 @@ public final class D3D12PresentationContext implements AutoCloseable {
             MemorySegment fencePtr = ppFence.get(ADDRESS, 0);
             long fenceHandle = createSharedHandle(arena, device, fencePtr);
 
-            MemorySegment captureDesc = fillResourceDesc(arena, width, height);
+            MemorySegment captureDesc = fillResourceDesc(
+                    arena, width, height, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM);
             MemorySegment captureTexture = createCaptureTexture(arena, device, captureDesc);
             long captureHandle = createSharedHandle(arena, device, captureTexture);
             long allocationSize = queryAllocationSize(arena, device, captureDesc);
@@ -181,14 +197,40 @@ public final class D3D12PresentationContext implements AutoCloseable {
             D3D12InteropSemaphore semaphore = new D3D12InteropSemaphore(fenceHandle);
             D3D12InteropContext.Resource glResource = new D3D12InteropContext.Resource(
                     0, 0, captureHandle, allocationSize,
-                    textureDescription(width, height), SRSurfaceFormat.R8G8B8A8_UNORM);
+                    textureDescription(width, height, TextureFormat.RGBA8, "D3D12PresentationCapture"),
+                    SRSurfaceFormat.R8G8B8A8_UNORM);
             GlD3D12ImportableTexture2D captureGlTexture =
                     new GlD3D12ImportableTexture2D(glResource);
+
+            // R32_FLOAT depth for XeSS-FG, written from GL each frame.
+            MemorySegment depthDesc = fillResourceDesc(
+                    arena, width, height, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R32_FLOAT);
+            MemorySegment depthTexture = createCaptureTexture(arena, device, depthDesc);
+            long depthHandle = createSharedHandle(arena, device, depthTexture);
+            long depthSize = queryAllocationSize(arena, device, depthDesc);
+            GlD3D12ImportableTexture2D depthGlTexture = new GlD3D12ImportableTexture2D(
+                    new D3D12InteropContext.Resource(0, 0, depthHandle, depthSize,
+                            textureDescription(width, height, TextureFormat.R32F, "D3D12PresentationDepth"),
+                            SRSurfaceFormat.R32_FLOAT));
+
+            // R16G16_FLOAT motion vectors for XeSS-FG, written from GL each frame.
+            MemorySegment mvDesc = fillResourceDesc(
+                    arena, width, height, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R16G16_FLOAT);
+            MemorySegment mvTexture = createCaptureTexture(arena, device, mvDesc);
+            long mvHandle = createSharedHandle(arena, device, mvTexture);
+            long mvSize = queryAllocationSize(arena, device, mvDesc);
+            GlD3D12ImportableTexture2D mvGlTexture = new GlD3D12ImportableTexture2D(
+                    new D3D12InteropContext.Resource(0, 0, mvHandle, mvSize,
+                            textureDescription(width, height, TextureFormat.RG16F, "D3D12PresentationMotionVector"),
+                            SRSurfaceFormat.R16G16_FLOAT));
 
             return new D3D12PresentationContext(
                     arena, hwnd, devicePtr, queuePtr, swapchainPtr, ppFactory.get(ADDRESS, 0),
                     allocatorPtr, listPtr, fencePtr,
-                    captureTexture, allocationSize, captureGlTexture, semaphore, width, height);
+                    captureTexture, allocationSize, captureGlTexture,
+                    depthTexture, depthSize, depthGlTexture,
+                    mvTexture, mvSize, mvGlTexture,
+                    semaphore, width, height);
         } catch (Throwable throwable) {
             arena.close();
             throw throwable;
@@ -302,7 +344,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
         return ppResource.get(ADDRESS, 0);
     }
 
-    private static MemorySegment fillResourceDesc(Arena arena, int width, int height) {
+    private static MemorySegment fillResourceDesc(Arena arena, int width, int height, int dxgiFormat) {
         MemorySegment resDesc = arena.allocate(
                 windows.win32.graphics.direct3d12.D3D12_RESOURCE_DESC.layout());
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_DESC.Dimension(
@@ -313,7 +355,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_DESC.DepthOrArraySize(resDesc, (short) 1);
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_DESC.MipLevels(resDesc, (short) 1);
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_DESC.Format(
-                resDesc, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM);
+                resDesc, dxgiFormat);
         MemorySegment sampleDesc = arena.allocate(
                 windows.win32.graphics.dxgi.common.DXGI_SAMPLE_DESC.layout());
         windows.win32.graphics.dxgi.common.DXGI_SAMPLE_DESC.Count(sampleDesc, 1);
@@ -371,14 +413,14 @@ public final class D3D12PresentationContext implements AutoCloseable {
         }
     }
 
-    private static TextureDescription textureDescription(int width, int height) {
+    private static TextureDescription textureDescription(int width, int height, TextureFormat format, String label) {
         return TextureDescription.create()
                 .type(TextureType.Texture2D)
                 .width(width)
                 .height(height)
-                .format(TextureFormat.RGBA8)
+                .format(format)
                 .usages(TextureUsages.create().sampler().storage())
-                .label("D3D12PresentationCapture")
+                .label(label)
                 .build();
     }
 
@@ -393,14 +435,25 @@ public final class D3D12PresentationContext implements AutoCloseable {
             if (lastD3d12Signal > 0) {
                 semaphore.waitFor(
                         lastD3d12Signal,
-                        new int[]{Math.toIntExact(captureGlTexture.handle())},
-                        new int[]{GL_LAYOUT_GENERAL_EXT});
+                        new int[]{
+                                Math.toIntExact(captureGlTexture.handle()),
+                                Math.toIntExact(depthGlTexture.handle()),
+                                Math.toIntExact(mvGlTexture.handle())
+                        },
+                        new int[]{GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT});
             }
             InteropResourcesConverter.flipY(finalColor, captureGlTexture);
+            // Copy the captured Iris depth/motion vectors into the shared D3D12 textures
+            // (same GL command stream, so one fence signal below covers all three).
+            D3D12FrameGeneration.writeFrameInputs(this);
             semaphore.signal(
                     captureValue,
-                    new int[]{Math.toIntExact(captureGlTexture.handle())},
-                    new int[]{GL_LAYOUT_GENERAL_EXT});
+                    new int[]{
+                            Math.toIntExact(captureGlTexture.handle()),
+                            Math.toIntExact(depthGlTexture.handle()),
+                            Math.toIntExact(mvGlTexture.handle())
+                    },
+                    new int[]{GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT});
         }
 
         windows.win32.graphics.direct3d12.ID3D12CommandQueue queueIface =
@@ -597,7 +650,16 @@ public final class D3D12PresentationContext implements AutoCloseable {
         height = newHeight;
     }
 
-    private void recreateSwapchain(int newWidth, int newHeight) {
+    /** Releases the swap chain so the XeSS-FG SDK can create its own on the window. */
+    public void releaseSwapchain() {
+        if (swapchain != null && swapchain.address() != 0L) {
+            windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain).Release();
+            swapchain = MemorySegment.NULL;
+        }
+    }
+
+    /** Recreates the swap chain (used to restore it if XeSS-FG initialization fails). */
+    public void recreateSwapchain(int newWidth, int newHeight) {
         // A window may only own one flip-model swap chain, so release the old one
         // before creating a replacement (otherwise CreateSwapChainForHwnd fails).
         if (swapchain.address() != 0) {
@@ -620,25 +682,59 @@ public final class D3D12PresentationContext implements AutoCloseable {
     }
 
     private void recreateCaptureResources(int newWidth, int newHeight) {
-        // Build the new capture texture fully before touching the old one, so a failure
-        // here leaves the previous capture intact instead of leaving captureGlTexture null
-        // (which would NPE in present() and crash the game).
+        // Build the new textures fully before touching the old ones, so a failure
+        // here leaves the previous ones intact instead of leaving a null that would
+        // NPE in present() and crash the game.
         windows.win32.graphics.direct3d12.ID3D12Device deviceIface =
                 windows.win32.graphics.direct3d12.ID3D12Device.wrap(device);
-        MemorySegment captureDesc = fillResourceDesc(arena, newWidth, newHeight);
+
+        MemorySegment captureDesc = fillResourceDesc(
+                arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM);
         MemorySegment newCaptureTexture = createCaptureTexture(arena, deviceIface, captureDesc);
         long captureHandle = createSharedHandle(arena, deviceIface, newCaptureTexture);
         long newSize = queryAllocationSize(arena, deviceIface, captureDesc);
-        D3D12InteropContext.Resource glResource = new D3D12InteropContext.Resource(
-                0, 0, captureHandle, newSize,
-                textureDescription(newWidth, newHeight), SRSurfaceFormat.R8G8B8A8_UNORM);
-        GlD3D12ImportableTexture2D newCaptureGlTexture = new GlD3D12ImportableTexture2D(glResource);
+        GlD3D12ImportableTexture2D newCaptureGlTexture = new GlD3D12ImportableTexture2D(
+                new D3D12InteropContext.Resource(0, 0, captureHandle, newSize,
+                        textureDescription(newWidth, newHeight, TextureFormat.RGBA8, "D3D12PresentationCapture"),
+                        SRSurfaceFormat.R8G8B8A8_UNORM));
         if (captureGlTexture != null) {
             captureGlTexture.destroy();
         }
         this.captureTexture = newCaptureTexture;
         this.captureAllocationSize = newSize;
         this.captureGlTexture = newCaptureGlTexture;
+
+        MemorySegment depthDesc = fillResourceDesc(
+                arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R32_FLOAT);
+        MemorySegment newDepthTexture = createCaptureTexture(arena, deviceIface, depthDesc);
+        long depthHandle = createSharedHandle(arena, deviceIface, newDepthTexture);
+        long depthSize = queryAllocationSize(arena, deviceIface, depthDesc);
+        GlD3D12ImportableTexture2D newDepthGlTexture = new GlD3D12ImportableTexture2D(
+                new D3D12InteropContext.Resource(0, 0, depthHandle, depthSize,
+                        textureDescription(newWidth, newHeight, TextureFormat.R32F, "D3D12PresentationDepth"),
+                        SRSurfaceFormat.R32_FLOAT));
+        if (depthGlTexture != null) {
+            depthGlTexture.destroy();
+        }
+        this.depthTexture = newDepthTexture;
+        this.depthAllocationSize = depthSize;
+        this.depthGlTexture = newDepthGlTexture;
+
+        MemorySegment mvDesc = fillResourceDesc(
+                arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R16G16_FLOAT);
+        MemorySegment newMvTexture = createCaptureTexture(arena, deviceIface, mvDesc);
+        long mvHandle = createSharedHandle(arena, deviceIface, newMvTexture);
+        long mvSize = queryAllocationSize(arena, deviceIface, mvDesc);
+        GlD3D12ImportableTexture2D newMvGlTexture = new GlD3D12ImportableTexture2D(
+                new D3D12InteropContext.Resource(0, 0, mvHandle, mvSize,
+                        textureDescription(newWidth, newHeight, TextureFormat.RG16F, "D3D12PresentationMotionVector"),
+                        SRSurfaceFormat.R16G16_FLOAT));
+        if (mvGlTexture != null) {
+            mvGlTexture.destroy();
+        }
+        this.mvTexture = newMvTexture;
+        this.mvAllocationSize = mvSize;
+        this.mvGlTexture = newMvGlTexture;
     }
 
     private void waitForGpu() {
@@ -698,6 +794,26 @@ public final class D3D12PresentationContext implements AutoCloseable {
     /** Replaces the swap chain, e.g. with the XeSS-FG proxy swap chain. */
     public void setSwapchain(MemorySegment swapchain) {
         this.swapchain = swapchain;
+    }
+
+    /** The D3D12 depth resource (R32_FLOAT), tagged to XeSS-FG each present. */
+    public MemorySegment depthTexture() {
+        return depthTexture;
+    }
+
+    /** The D3D12 motion-vector resource (R16G16_FLOAT), tagged to XeSS-FG each present. */
+    public MemorySegment mvTexture() {
+        return mvTexture;
+    }
+
+    /** GL view of the depth resource, for writing the frame's depth each present. */
+    public GlD3D12ImportableTexture2D depthGlTexture() {
+        return depthGlTexture;
+    }
+
+    /** GL view of the motion-vector resource, for writing the frame's MV each present. */
+    public GlD3D12ImportableTexture2D mvGlTexture() {
+        return mvGlTexture;
     }
 
     /** Matches the OpenGL vsync setting: flip-model Present uses syncInterval 1 (wait for
