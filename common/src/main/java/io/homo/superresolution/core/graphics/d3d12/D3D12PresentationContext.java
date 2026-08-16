@@ -496,6 +496,12 @@ public final class D3D12PresentationContext implements AutoCloseable {
                 imageIndex, windows.win32.graphics.direct3d12.ID3D12Resource.iid(), ppBackBuffer));
         MemorySegment backBuffer = ppBackBuffer.get(ADDRESS, 0);
 
+        // Only the capture texture and back buffer are transitioned here. The depth/mv
+        // XeSS-FG inputs are shared (simultaneous-access) textures: they decay to COMMON
+        // at every ExecuteCommandLists completion, so a transition in this list cannot
+        // carry over to the SDK's own lists submitted during Present (a separate ECL).
+        // They are therefore tagged with incomingState COMMON and the SDK handles the
+        // transitions itself; an SRV declaration removes the device (0x887a0001).
         MemorySegment barriers = arena.allocate(
                 windows.win32.graphics.direct3d12.D3D12_RESOURCE_BARRIER.layout(), 2);
         MemorySegment b0 = barriers;
@@ -550,6 +556,9 @@ public final class D3D12PresentationContext implements AutoCloseable {
                 t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_SOURCE);
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
                 t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COMMON);
+        // Depth/mv are intentionally absent from the trailing barriers too: shared
+        // (simultaneous-access) textures are never transitioned on this side; they sit in
+        // COMMON for the SDK's Present-time lists (see the comment above the barriers).
         listIface.ResourceBarrier(2, barriers);
 
         checkHr(listIface.Close());
@@ -576,10 +585,23 @@ public final class D3D12PresentationContext implements AutoCloseable {
                 break;
             }
         }
-        if (fenceIface.GetCompletedValue() < captureValue) {
+        long completedAfterWait = fenceIface.GetCompletedValue();
+        if (completedAfterWait < captureValue) {
             io.homo.superresolution.common.SuperResolution.LOGGER.warn(
                     "[D3D12] timed out waiting for flipY fence {} (completed {})",
-                    captureValue, fenceIface.GetCompletedValue());
+                    captureValue, completedAfterWait);
+            if (completedAfterWait == -1L) {
+                // GetCompletedValue returns UINT64_MAX (reads as -1) when the device is
+                // removed: the GL semaphore can never signal again, so every later present
+                // would spin in the timeouts above. Log the driver's removal reason and
+                // stop frame generation; throwing lets the presentation feature disable
+                // the D3D12 path instead of hanging on the loading screen forever.
+                int removalReason = windows.win32.graphics.direct3d12.ID3D12Device.wrap(device)
+                        .GetDeviceRemovedReason();
+                D3D12FrameGeneration.onDeviceRemoved(removalReason);
+                throw new IllegalStateException("D3D12 device removed (reason 0x"
+                        + Integer.toHexString(removalReason) + ")");
+            }
         }
 
         // Stamp the present latency markers. The Vulkan swapchain does this in its own

@@ -177,11 +177,15 @@ public final class D3D12FrameGeneration {
             // Restore the presentation swap chain so rendering keeps working.
             try {
                 presentation.recreateSwapchain(presentation.width(), presentation.height());
-            } catch (Throwable throwable) {
+                SuperResolution.LOGGER.info("[D3D12] XeSS-FG initialization failed; swap chain restored");
+            } catch (Throwable restoreFailure) {
+                // The presentation swap chain is already released and cannot be recreated
+                // (e.g. the device died mid-initialization). A null swap chain would crash
+                // the next present natively, so fall out of the D3D12 presentation entirely.
                 SuperResolution.LOGGER.error(
-                        "[D3D12] XeSS-FG init failed and swap chain restore failed", throwable);
+                        "[D3D12] XeSS-FG init failed and swap chain restore failed", restoreFailure);
+                D3D12PresentationFeature.disableAfterFailure(restoreFailure);
             }
-            SuperResolution.LOGGER.info("[D3D12] XeSS-FG initialization failed; swap chain restored");
         }
     }
 
@@ -260,9 +264,38 @@ public final class D3D12FrameGeneration {
         }
     }
 
+    /**
+     * Called by the D3D12 presentation when it detects the device was removed
+     * (fence GetCompletedValue returns UINT64_MAX). Disables interpolation so the
+     * dead SDK context is not fed further tags; the caller disables the whole
+     * D3D12 presentation afterwards.
+     */
+    public static void onDeviceRemoved(int removalReason) {
+        SuperResolution.LOGGER.error(
+                "[D3D12] D3D12 device removed (GetDeviceRemovedReason=0x{}); disabling XeSS-FG",
+                Integer.toHexString(removalReason));
+        if (provider != null && enabled) {
+            try {
+                provider.setEnabled(false);
+            } catch (Throwable throwable) {
+                SuperResolution.LOGGER.warn(
+                        "[D3D12] XeSS-FG disable after device removal failed", throwable);
+            }
+            enabled = false;
+        }
+    }
+
     /** Tears down the provider and restores the presentation swap chain. */
     public static synchronized void shutdown() {
         if (provider != null) {
+            // Drop our reference to the proxy swap chain first: the SDK refuses
+            // xefgSwapChainDestroy with -19 (POINTER_STILL_IN_USE) while any proxy
+            // reference is alive, and the presentation holds the one returned by
+            // GetSwapChainPtr.
+            if (presentation != null) {
+                presentation.releaseSwapchain();
+                presentation.resetPresentSlot();
+            }
             try {
                 provider.shutdownD3D12();
             } catch (Throwable throwable) {
@@ -270,9 +303,6 @@ public final class D3D12FrameGeneration {
             }
             provider = null;
             enabled = false;
-        }
-        if (presentation != null) {
-            presentation.resetPresentSlot();
         }
         presentation = null;
         cachedDepth = null;

@@ -132,7 +132,15 @@ public final class D3D12PresentationFeature {
         // The Vulkan path stamps render-submit-end from its presentation window; the D3D12
         // presentation has no such hook, so stamp it here so the XeLL markers are complete.
         LowLatency.endRenderSubmission();
-        presentationContext.present(finalColor);
+        try {
+            presentationContext.present(finalColor);
+        } catch (Throwable throwable) {
+            // A removed device or a broken swap chain cannot recover inside the frame
+            // loop (presenting again would spin in fence timeouts or crash natively);
+            // disable the D3D12 presentation so the game falls back instead.
+            SuperResolution.LOGGER.warn("D3D12 present failed, disabling D3D12 presentation", throwable);
+            disableAfterFailure(throwable);
+        }
     }
 
     public static boolean isInitialized() {
