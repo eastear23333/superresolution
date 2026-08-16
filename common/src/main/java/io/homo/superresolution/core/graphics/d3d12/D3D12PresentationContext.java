@@ -27,13 +27,17 @@ import org.lwjgl.opengl.GL;
 import org.lwjgl.system.MemoryStack;
 
 import java.lang.foreign.Arena;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
+import java.lang.invoke.MethodHandle;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
+import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 import static org.lwjgl.opengl.EXTSemaphore.GL_LAYOUT_GENERAL_EXT;
 
@@ -46,6 +50,20 @@ import static org.lwjgl.opengl.EXTSemaphore.GL_LAYOUT_GENERAL_EXT;
  * chain back buffer and presents.
  */
 public final class D3D12PresentationContext implements AutoCloseable {
+    /**
+     * Cached Present vtable slot (slot 8) of the current swap chain. XeSS-FG's proxy
+     * nulls its Present slot after the first Present, so once captured we keep calling
+     * this function pointer directly (OptiScaler does the same by detouring o_FGSCPresent
+     * once instead of re-reading the vtable each present).
+     */
+    private static final Linker NATIVE_LINKER = Linker.nativeLinker();
+    // downcallHandle prepends the symbol (function pointer) argument, so the descriptor
+    // only lists (this, syncInterval, flags).
+    private static final FunctionDescriptor PRESENT_DESC =
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT);
+    private static final MethodHandle PRESENT_DOWN = NATIVE_LINKER.downcallHandle(PRESENT_DESC);
+    private static volatile long cachedXefgPresentFn;
+
     private final Arena arena;
     private final long hwnd;
     private final MemorySegment device;
@@ -524,8 +542,10 @@ public final class D3D12PresentationContext implements AutoCloseable {
 
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
                 t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_DEST);
+        // Return the back buffer to PRESENT state (not COMMON) before Present: the XeSS-FG
+        // proxy tracks the back-buffer state and expects PRESENT for a presented buffer.
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
-                t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COMMON);
+                t1, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_PRESENT);
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateBefore(
                 t0, windows.win32.graphics.direct3d12.D3D12_RESOURCE_STATES.D3D12_RESOURCE_STATE_COPY_SOURCE);
         windows.win32.graphics.direct3d12.D3D12_RESOURCE_TRANSITION_BARRIER.StateAfter(
@@ -566,16 +586,85 @@ public final class D3D12PresentationContext implements AutoCloseable {
         // present path; the D3D12 presentation has no equivalent hook, so do it here for
         // the XeLL low-latency provider (present-start/end frame the swapchain Present).
         LowLatency.beginPresent();
+        io.homo.superresolution.common.SuperResolution.LOGGER.info(
+                "[D3D12] present: swapchain=0x{} vsync={}", Long.toHexString(swapchain.address()), vsync);
+        // Diagnose the Present vtable slot (8). The cached function pointer is captured on
+        // XeSS-FG takeover (capturePresentSlot), not here, so an ordinary swap chain's slot
+        // never leaks into the proxy present path.
+        long presentSlot = 0L;
+        try {
+            MemorySegment vtable = swapchain.reinterpret(ADDRESS.byteSize()).get(ADDRESS, 0);
+            presentSlot = vtable.reinterpret(ADDRESS.byteSize() * 12)
+                    .get(ADDRESS, ADDRESS.byteSize() * 8).address();
+            io.homo.superresolution.common.SuperResolution.LOGGER.info(
+                    "[D3D12] present vtable: vtable=0x{} slot8=0x{} cache=0x{}",
+                    Long.toHexString(vtable.address()), Long.toHexString(presentSlot),
+                    Long.toHexString(cachedXefgPresentFn));
+        } catch (Throwable throwable) {
+            io.homo.superresolution.common.SuperResolution.LOGGER.warn(
+                    "[D3D12] vtable read failed", throwable);
+        }
         // If XeSS-FG took over the swap chain, tag constants and set the present id right
         // before Present so the proxy can generate interpolated frames.
-        D3D12FrameGeneration.beforePresent((int) (LowLatency.currentLatencyFrameId() & 0xFFFFFFFFL));
-        swapchainIface.Present(vsync ? 1 : 0, 0);
+        D3D12FrameGeneration.beforePresent();
+        int presentResult = presentSwapchain(swapchain, vsync);
+        io.homo.superresolution.common.SuperResolution.LOGGER.info(
+                "[D3D12] present result=0x{}", Integer.toHexString(presentResult));
         LowLatency.endPresent();
 
         long signalValue = nextGlFence + 1;
         queueIface.Signal(fence, signalValue);
         lastD3d12Signal = signalValue;
         nextGlFence += 2;
+    }
+
+    /** Clears the cached Present slot (e.g. when the XeSS-FG proxy is torn down). */
+    public void resetPresentSlot() {
+        cachedXefgPresentFn = 0L;
+    }
+
+    /**
+     * Captures the current swap chain's Present vtable slot (8) once. Called on XeSS-FG
+     * takeover: the proxy nulls the slot after the first Present, so the captured function
+     * pointer is what keeps later presents working.
+     */
+    public void capturePresentSlot() {
+        try {
+            MemorySegment vtable = swapchain.reinterpret(ADDRESS.byteSize()).get(ADDRESS, 0);
+            long slot = vtable.reinterpret(ADDRESS.byteSize() * 12)
+                    .get(ADDRESS, ADDRESS.byteSize() * 8).address();
+            if (slot != 0L) {
+                cachedXefgPresentFn = slot;
+                io.homo.superresolution.common.SuperResolution.LOGGER.info(
+                        "[D3D12] captured XeSS-FG Present slot=0x{}", Long.toHexString(slot));
+            } else {
+                io.homo.superresolution.common.SuperResolution.LOGGER.warn(
+                        "[D3D12] captured Present slot is NULL");
+            }
+        } catch (Throwable throwable) {
+            io.homo.superresolution.common.SuperResolution.LOGGER.warn(
+                    "[D3D12] capture Present slot failed", throwable);
+        }
+    }
+
+    /**
+     * Presents through the current swap chain. When XeSS-FG took over, the proxy nulls its
+     * Present vtable slot after the first Present, so a cached function pointer captured on
+     * takeover is used instead of re-reading the vtable each frame.
+     */
+    private static int presentSwapchain(MemorySegment swapchain, boolean vsync) {
+        long fn = cachedXefgPresentFn;
+        if (fn == 0L) {
+            // No XeSS-FG takeover yet: present through the plain vtable like before.
+            return windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain)
+                    .Present(vsync ? 1 : 0, 0);
+        }
+        try {
+            return (int) PRESENT_DOWN.invokeExact(
+                    MemorySegment.ofAddress(fn), swapchain, (int) (vsync ? 1 : 0), (int) 0);
+        } catch (Throwable throwable) {
+            throw new RuntimeException("D3D12 present via cached XeSS-FG slot failed", throwable);
+        }
     }
 
     private static MemorySegment buildSwapchainDesc(Arena arena, int width, int height) {

@@ -56,13 +56,12 @@ public final class D3D12FrameGeneration {
     /** The XESS_FG group representative id, which the config stores when selected. */
     private static final String XESS_FG_GROUP_ID = "superresolution:xess_fg";
     /**
-     * TEMP: XeSS-FG proxy swap-chain takeover is disabled pending a rework of the
-     * D3D12 present path against OptiScaler's FGPresent interception. The backend stays
-     * registered and selectable, but initialize() no longer releases the presentation
-     * swap chain nor swaps in the XeSS-FG proxy, so the D3D12 presentation runs stable.
-     * Re-enable once the proxy-Present crash is resolved.
+     * XeSS-FG proxy swap-chain takeover. Disabled previously because the proxy Present
+     * crashed in native code; re-enabled after aligning the per-frame path with OptiScaler
+     * (tag/SetPresentId only when depth+motion vectors are present, own present counter,
+     * NULL command list for UNTIL_NEXT_PRESENT on SDK 1.3.1+).
      */
-    private static final boolean XEFG_TAKEOVER_ENABLED = false;
+    private static final boolean XEFG_TAKEOVER_ENABLED = true;
 
     private static D3D12FrameGenerationProvider provider;
     private static boolean enabled;
@@ -71,6 +70,12 @@ public final class D3D12FrameGeneration {
     private static boolean eventRegistered;
     private static ITexture cachedDepth;
     private static ITexture cachedMotionVector;
+    /**
+     * Monotonically increasing present id for XeSS-FG resource tagging. OptiScaler tags
+     * each frame with an internal per-present counter; the XeLL latency frame id is not
+     * kept in lock-step with the present sequence, so it is not used here.
+     */
+    private static long xefgPresentCounter;
 
     private D3D12FrameGeneration() {
     }
@@ -91,10 +96,8 @@ public final class D3D12FrameGeneration {
         InputResourceSet resources = event.getDispatchResource().resources();
         cachedDepth = resources.depthTexture();
         cachedMotionVector = resources.motionVectorsTexture();
-        if (cachedDepth == null || cachedMotionVector == null) {
-            SuperResolution.LOGGER.info("[D3D12] XeSS-FG dispatch: depth={} motionVector={}",
-                    cachedDepth != null, cachedMotionVector != null);
-        }
+        SuperResolution.LOGGER.info("[D3D12] XeSS-FG dispatch: depth={} motionVector={}",
+                cachedDepth != null, cachedMotionVector != null);
     }
 
     /**
@@ -160,7 +163,14 @@ public final class D3D12FrameGeneration {
         if (proxy != 0L) {
             presentation.setSwapchain(MemorySegment.ofAddress(proxy));
             provider = d3d12Provider;
-            enabled = true;
+            // Keep enabled=false: XeSS-FG starts disabled and is only enabled once a frame
+            // actually provides depth/motion vectors (beforePresent). Marking it enabled
+            // here made the first input-less frame think interpolation was on and call
+            // SetEnabled(false), which crashed the freshly-created proxy Present.
+            enabled = false;
+            // Capture the proxy's Present slot now; the proxy nulls it after the first
+            // Present, so this cached pointer is what later presents call.
+            presentation.capturePresentSlot();
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG took over the swap chain (proxy={})",
                     Long.toHexString(proxy));
         } else {
@@ -178,8 +188,9 @@ public final class D3D12FrameGeneration {
     /**
      * Tags this frame's constants and resources and sets the present id on the provider.
      * Called from the D3D12 present path right before the swap chain {@code Present}.
+     * No-op while depth/motion vectors are unavailable, so the proxy stays in passthrough.
      */
-    public static void beforePresent(int presentId) {
+    public static void beforePresent() {
         // If initialization was deferred waiting for the XeLL context, retry now that the
         // low-latency renegotiation has run.
         if (provider == null && pendingInit && presentation != null
@@ -190,24 +201,36 @@ public final class D3D12FrameGeneration {
         if (active == null) {
             return;
         }
+        // Own per-present counter for the XeSS-FG frame id (see field docs).
+        int xefgFrameId = (int) (xefgPresentCounter++ & 0xFFFFFFFFL);
         try {
             boolean hasInputs = cachedDepth != null && cachedMotionVector != null && presentation != null;
-            long depthResource = 0L;
-            long mvResource = 0L;
             if (hasInputs) {
-                depthResource = presentation.depthTexture().address();
-                mvResource = presentation.mvTexture().address();
+                // Only tag constants/resources (and enable interpolation) once both depth
+                // and motion vectors are available for this frame. OptiScaler never calls
+                // SetPresentId/TagFrameConstants while XeSS-FG is disabled or inputs are
+                // missing; doing so crashes the proxy Present in native code.
+                if (!enabled) {
+                    active.setEnabled(true);
+                    enabled = true;
+                }
+                SuperResolution.LOGGER.info("[D3D12] XeSS-FG tag frame {} (enabled={})",
+                        xefgFrameId, enabled);
+                active.prepareD3D12Present(
+                        xefgFrameId, viewMatrix(), projectionMatrix(),
+                        0.0f, 0.0f, 1.0f, 1.0f, false,
+                        presentation.depthTexture().address(),
+                        presentation.mvTexture().address());
+            } else if (enabled) {
+                // The depth/motion-vector stream dropped (e.g. a menu/pause covers the
+                // scene); disable interpolation so the next Present is a plain passthrough
+                // instead of a tagged-but-inputless frame.
+                SuperResolution.LOGGER.info("[D3D12] XeSS-FG inputs dropped, disabling");
+                active.setEnabled(false);
+                enabled = false;
+            } else {
+                SuperResolution.LOGGER.info("[D3D12] XeSS-FG passthrough (no inputs)");
             }
-            // XeSS-FG's proxy Present crashes in native code when enabled without
-            // depth/motion-vector inputs, so interpolation only runs when they are present.
-            if (hasInputs != enabled) {
-                active.setEnabled(hasInputs);
-                enabled = hasInputs;
-            }
-            active.prepareD3D12Present(
-                    presentId, viewMatrix(), projectionMatrix(),
-                    0.0f, 0.0f, 1.0f, 1.0f, false,
-                    depthResource, mvResource);
         } catch (Throwable throwable) {
             SuperResolution.LOGGER.warn("[D3D12] XeSS-FG preparePresent failed", throwable);
         }
@@ -247,6 +270,9 @@ public final class D3D12FrameGeneration {
             }
             provider = null;
             enabled = false;
+        }
+        if (presentation != null) {
+            presentation.resetPresentSlot();
         }
         presentation = null;
         cachedDepth = null;
