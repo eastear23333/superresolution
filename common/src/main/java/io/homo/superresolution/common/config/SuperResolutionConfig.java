@@ -711,6 +711,27 @@ public class SuperResolutionConfig {
         #endif
     }
 
+    /**
+     * The presentation mode actually in effect, accounting for the "skip initialization"
+     * toggles: when Vulkan/D3D12 initialization is skipped, a stored Vulkan/D3D12 mode
+     * automatically falls back to OpenGL (both for the UI and the active rendering API,
+     * which refuses to start the skipped feature).
+     */
+    public static PresentationMode getEffectivePresentationMode() {
+        #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
+        PresentationMode mode = getPresentationMode();
+        if (mode == PresentationMode.VULKAN && isSkipInitVulkan()) {
+            return PresentationMode.OPENGL;
+        }
+        if (mode == PresentationMode.D3D12 && isSkipInitD3D12()) {
+            return PresentationMode.OPENGL;
+        }
+        return mode;
+        #else
+        return PresentationMode.OPENGL;
+        #endif
+    }
+
     public static void setPresentationMode(PresentationMode mode) {
         #if (MC_VER >= MC_1_21_11 && MC_VER < MC_26_2) || MC_VER == MC_1_21_1
         if (mode == null) {

@@ -1012,7 +1012,7 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                 Text.translatable("superresolution.screen.config.category.presentation"),
                 builder -> builder.selectorOption(
                                 Text.translatable("superresolution.screen.config.options.label.presentation_mode"),
-                                SuperResolutionConfig.getPresentationMode(),
+                                SuperResolutionConfig.getEffectivePresentationMode(),
                                 PresentationMode.values())
                         .setDefaultValue(() -> PresentationMode.OPENGL)
                         .setNameProvider(mode -> Text.translatable(
@@ -1023,16 +1023,23 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                         .setDescription(Text.translatable(
                                 "superresolution.screen.config.options.tooltip.presentation_mode"
                         ))
-                        .setEnableRequirement(OptionRequirement.not(
-                                SuperResolutionConfig::isSkipInitVulkan
-                        ))
-                        .setTooltipSupplier(value -> Optional.of(Tooltip.withContext(
-                                Text.translatable(
-                                        SuperResolutionConfig.isSkipInitVulkan()
-                                                ? "superresolution.screen.config.options.tooltip.presentation_mode.vulkan_disabled"
-                                                : "superresolution.screen.config.options.tooltip.presentation_mode"
-                                ).getString()
-                        )))
+                        .setTooltipSupplier(value -> {
+                            // A stored Vulkan/D3D12 mode that is skipped at init falls back
+                            // to OpenGL; surface that instead of showing a mode that is not
+                            // actually active.
+                            PresentationMode raw = SuperResolutionConfig.getPresentationMode();
+                            String tooltipKey;
+                            if (raw == PresentationMode.VULKAN && SuperResolutionConfig.isSkipInitVulkan()) {
+                                tooltipKey = "superresolution.screen.config.options.tooltip.presentation_mode.vulkan_disabled";
+                            } else if (raw == PresentationMode.D3D12 && SuperResolutionConfig.isSkipInitD3D12()) {
+                                tooltipKey = "superresolution.screen.config.options.tooltip.presentation_mode.d3d12_disabled";
+                            } else {
+                                tooltipKey = "superresolution.screen.config.options.tooltip.presentation_mode";
+                            }
+                            return Optional.of(Tooltip.withContext(
+                                    Text.translatable(tooltipKey).getString()
+                            ));
+                        })
                         .setSaveConsumer((Consumer<PresentationMode>) mode -> {
                             SuperResolutionConfig.setPresentationMode(mode);
                             // Any presentation-mode change invalidates the currently
@@ -1063,20 +1070,10 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                             .setNameProvider(g -> g.getDisplayName().getString())
                             .setValuesSupplier(this::lowLatencyGroups)
                             .setDescription(Text.translatable("superresolution.screen.config.options.tooltip.low_latency_mode"))
-                            // Read the presentation mode config directly (not the cached
-                            // feature flags) so the group collapses immediately when OpenGL
-                            // is selected in this same screen.
-                            .setDisplayRequirement(OptionRequirement.isTrue(
-                                    () -> SuperResolutionConfig.getPresentationMode() != PresentationMode.OPENGL))
-                            .setEnableRequirement(
-                                    () -> SuperResolutionConfig.getPresentationMode() != PresentationMode.OPENGL)
-                            .setTooltipSupplier(value -> Optional.of(Tooltip.withContext(
-                                    Text.translatable(
-                                            SuperResolutionConfig.getPresentationMode() != PresentationMode.OPENGL
-                                                    ? "superresolution.screen.config.options.tooltip.low_latency_mode"
-                                                    : "superresolution.screen.config.options.tooltip.low_latency_mode.presentation_required"
-                                    ).getString()
-                            )))
+                            // Low-latency settings stay visible under every presentation
+                            // mode (including OpenGL): each backend item is gated by its
+                            // own presentation requirement below instead (Reflex needs the
+                            // Vulkan presentation, XeLL the D3D12 one).
                             .setItemEnableRequirement(this::getLowLatencyGroupItemRequirement)
                             .setMenuItemTooltipSupplier(group -> {
                                 BackendGroup backendGroup = (BackendGroup) group;
@@ -1426,7 +1423,6 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                                     SuperResolutionConfig.isSkipInitD3D12())
                             .setDescription(Text.translatable("superresolution.screen.config.options.tooltip.skip_init_d3d12"))
                             .setDefaultValue(() -> true)
-                            .setRequireRestartGame(true)
                             .setSaveConsumer(SuperResolutionConfig::setSkipInitD3D12)
                             .build();
 
