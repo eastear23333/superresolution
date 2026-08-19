@@ -104,6 +104,10 @@ public final class D3D12PresentationContext implements AutoCloseable {
     private MemorySegment mvTexture;
     private long mvAllocationSize;
     private GlD3D12ImportableTexture2D mvGlTexture;
+    /** R8G8B8A8 HUD-less color for XeSS-FG UI composition, written from GL. */
+    private MemorySegment hudlessTexture;
+    private long hudlessAllocationSize;
+    private GlD3D12ImportableTexture2D hudlessGlTexture;
     private final D3D12InteropSemaphore semaphore;
     /** Back buffers cached per swap-chain index (one COM reference each), avoiding a GetBuffer/Release pair every present. */
     private final MemorySegment[] backBuffers = new MemorySegment[8];
@@ -122,6 +126,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
             GlD3D12ImportableTexture2D captureGlTexture,
             MemorySegment depthTexture, long depthAllocationSize, GlD3D12ImportableTexture2D depthGlTexture,
             MemorySegment mvTexture, long mvAllocationSize, GlD3D12ImportableTexture2D mvGlTexture,
+            MemorySegment hudlessTexture, long hudlessAllocationSize, GlD3D12ImportableTexture2D hudlessGlTexture,
             D3D12InteropSemaphore semaphore, int width, int height) {
         this.arena = arena;
         this.hwnd = hwnd;
@@ -141,6 +146,9 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.mvTexture = mvTexture;
         this.mvAllocationSize = mvAllocationSize;
         this.mvGlTexture = mvGlTexture;
+        this.hudlessTexture = hudlessTexture;
+        this.hudlessAllocationSize = hudlessAllocationSize;
+        this.hudlessGlTexture = hudlessGlTexture;
         this.semaphore = semaphore;
         this.width = width;
         this.height = height;
@@ -269,12 +277,26 @@ public final class D3D12PresentationContext implements AutoCloseable {
                             textureDescription(width, height, TextureFormat.RG16F, "D3D12PresentationMotionVector"),
                             SRSurfaceFormat.R16G16_FLOAT));
 
+            // R8G8B8A8 HUD-less color for XeSS-FG UI composition (BACKBUFFER_HUDLESS):
+            // same format and color space as the back buffer per the SDK requirements,
+            // written from the pre-UI shader-compat color each frame.
+            MemorySegment hudlessDesc = fillResourceDesc(
+                    arena, width, height, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM);
+            MemorySegment hudlessTexture = createCaptureTexture(arena, device, hudlessDesc);
+            long hudlessHandle = createSharedHandle(arena, device, hudlessTexture);
+            long hudlessSize = queryAllocationSize(arena, device, hudlessDesc);
+            GlD3D12ImportableTexture2D hudlessGlTexture = new GlD3D12ImportableTexture2D(
+                    new D3D12InteropContext.Resource(0, 0, hudlessHandle, hudlessSize,
+                            textureDescription(width, height, TextureFormat.RGBA8, "D3D12PresentationHudless"),
+                            SRSurfaceFormat.R8G8B8A8_UNORM));
+
             return new D3D12PresentationContext(
                     arena, hwnd, devicePtr, queuePtr, swapchainPtr, ppFactory.get(ADDRESS, 0),
                     allocators, listPtr, fencePtr,
                     captureTexture, allocationSize, captureGlTexture,
                     depthTexture, depthSize, depthGlTexture,
                     mvTexture, mvSize, mvGlTexture,
+                    hudlessTexture, hudlessSize, hudlessGlTexture,
                     semaphore, width, height);
         } catch (Throwable throwable) {
             arena.close();
@@ -486,22 +508,26 @@ public final class D3D12PresentationContext implements AutoCloseable {
                         new int[]{
                                 Math.toIntExact(captureGlTexture.handle()),
                                 Math.toIntExact(depthGlTexture.handle()),
-                                Math.toIntExact(mvGlTexture.handle())
+                                Math.toIntExact(mvGlTexture.handle()),
+                                Math.toIntExact(hudlessGlTexture.handle())
                         },
-                        new int[]{GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT});
+                        new int[]{GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT,
+                                GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT});
             }
             InteropResourcesConverter.flipY(finalColor, captureGlTexture);
             // Copy the captured Iris depth/motion vectors into the shared D3D12 textures
-            // (same GL command stream, so one fence signal below covers all three).
+            // (same GL command stream, so one fence signal below covers all four).
             D3D12FrameGeneration.writeFrameInputs(this);
             semaphore.signal(
                     captureValue,
                     new int[]{
                             Math.toIntExact(captureGlTexture.handle()),
                             Math.toIntExact(depthGlTexture.handle()),
-                            Math.toIntExact(mvGlTexture.handle())
+                            Math.toIntExact(mvGlTexture.handle()),
+                            Math.toIntExact(hudlessGlTexture.handle())
                     },
-                    new int[]{GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT});
+                    new int[]{GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT,
+                            GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT});
         }
 
         // Per-frame segments (barriers, copy locations, event) live in a confined arena:
@@ -990,6 +1016,22 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.mvTexture = newMvTexture;
         this.mvAllocationSize = mvSize;
         this.mvGlTexture = newMvGlTexture;
+
+        MemorySegment hudlessDesc = fillResourceDesc(
+                arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM);
+        MemorySegment newHudlessTexture = createCaptureTexture(arena, deviceIface, hudlessDesc);
+        long hudlessHandle = createSharedHandle(arena, deviceIface, newHudlessTexture);
+        long hudlessSize = queryAllocationSize(arena, deviceIface, hudlessDesc);
+        GlD3D12ImportableTexture2D newHudlessGlTexture = new GlD3D12ImportableTexture2D(
+                new D3D12InteropContext.Resource(0, 0, hudlessHandle, hudlessSize,
+                        textureDescription(newWidth, newHeight, TextureFormat.RGBA8, "D3D12PresentationHudless"),
+                        SRSurfaceFormat.R8G8B8A8_UNORM));
+        if (hudlessGlTexture != null) {
+            hudlessGlTexture.destroy();
+        }
+        this.hudlessTexture = newHudlessTexture;
+        this.hudlessAllocationSize = hudlessSize;
+        this.hudlessGlTexture = newHudlessGlTexture;
     }
 
     private void waitForGpu() {
@@ -1070,6 +1112,16 @@ public final class D3D12PresentationContext implements AutoCloseable {
     /** GL view of the motion-vector resource, for writing the frame's MV each present. */
     public GlD3D12ImportableTexture2D mvGlTexture() {
         return mvGlTexture;
+    }
+
+    /** The D3D12 HUD-less color resource (R8G8B8A8), tagged to XeSS-FG each present. */
+    public MemorySegment hudlessTexture() {
+        return hudlessTexture;
+    }
+
+    /** GL view of the HUD-less resource, for writing the frame's pre-UI color each present. */
+    public GlD3D12ImportableTexture2D hudlessGlTexture() {
+        return hudlessGlTexture;
     }
 
     /** Matches the OpenGL vsync setting: flip-model Present uses syncInterval 1 (wait for

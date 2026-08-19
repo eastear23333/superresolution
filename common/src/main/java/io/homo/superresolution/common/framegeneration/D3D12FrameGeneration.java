@@ -70,6 +70,10 @@ public final class D3D12FrameGeneration {
     private static boolean eventRegistered;
     private static ITexture cachedDepth;
     private static ITexture cachedMotionVector;
+    /** Pre-UI shader-compat color, tagged as XeSS-FG's HUD-less color for UI composition. */
+    private static ITexture cachedHudlessColor;
+    /** Whether UI composition is currently enabled on the provider. */
+    private static boolean uiCompositionApplied;
     /** Last frame time delta from the dispatch event, passed as frameRenderTime (ms). */
     private static float cachedFrameTimeDelta;
     /** Last multiplier pushed to the provider; re-synced from the config each present. */
@@ -107,14 +111,17 @@ public final class D3D12FrameGeneration {
         InputResourceSet resources = event.getDispatchResource().resources();
         boolean depthPresent = resources.depthTexture() != null;
         boolean mvPresent = resources.motionVectorsTexture() != null;
+        boolean hudlessPresent = resources.colorTexture() != null;
         boolean inputsChanged = (cachedDepth != null) != depthPresent
-                || (cachedMotionVector != null) != mvPresent;
+                || (cachedMotionVector != null) != mvPresent
+                || (cachedHudlessColor != null) != hudlessPresent;
         cachedDepth = resources.depthTexture();
         cachedMotionVector = resources.motionVectorsTexture();
+        cachedHudlessColor = resources.colorTexture();
         cachedFrameTimeDelta = event.getDispatchResource().frameTimeDelta();
         if (inputsChanged) {
-            SuperResolution.LOGGER.info("[D3D12] XeSS-FG dispatch: depth={} motionVector={}",
-                    depthPresent, mvPresent);
+            SuperResolution.LOGGER.info("[D3D12] XeSS-FG dispatch: depth={} motionVector={} hudlessColor={}",
+                    depthPresent, mvPresent, hudlessPresent);
         }
     }
 
@@ -135,6 +142,9 @@ public final class D3D12FrameGeneration {
         FrameGenerationRegistry.clearSupportCache();
         String configured = SuperResolutionConfig.getFrameGenerationProvider();
         if (!XESS_FG_GROUP_ID.equals(configured)) {
+            // Arm the deferred retry: selecting XeSS-FG mid-session must take over
+            // without a restart (beforePresent re-checks the config each frame).
+            pendingInit = true;
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG skipped: configured provider='{}'", configured);
             return;
         }
@@ -186,6 +196,7 @@ public final class D3D12FrameGeneration {
             reportedWidth = -1;
             reportedHeight = -1;
             lastCameraStateValid = false;
+            uiCompositionApplied = false;
             // Keep enabled=false: XeSS-FG starts disabled and is only enabled once a frame
             // actually provides depth/motion vectors (beforePresent). Marking it enabled
             // here made the first input-less frame think interpolation was on and call
@@ -218,9 +229,11 @@ public final class D3D12FrameGeneration {
      * No-op while depth/motion vectors are unavailable, so the proxy stays in passthrough.
      */
     public static void beforePresent() {
-        // If initialization was deferred waiting for the XeLL context, retry now that the
-        // low-latency renegotiation has run.
+        // If initialization was deferred (XeLL context not ready, or XeSS-FG selected
+        // mid-session), retry now that the low-latency renegotiation has run and the
+        // configured provider matches; the config check keeps the per-frame retry cheap.
         if (provider == null && pendingInit && presentation != null
+                && XESS_FG_GROUP_ID.equals(SuperResolutionConfig.getFrameGenerationProvider())
                 && XeLLowLatency.context().address() != 0L) {
             initialize(presentation);
         }
@@ -232,6 +245,15 @@ public final class D3D12FrameGeneration {
         int xefgFrameId = (int) (xefgPresentCounter++ & 0xFFFFFFFFL);
         try {
             syncConfiguredState(active);
+            // Toggle UI composition with the HUD-less color's availability: interpolating
+            // the UI itself (semi-transparent Minecraft HUD) produces jelly-like warping.
+            boolean hudlessAvailable = cachedHudlessColor != null && presentation != null;
+            if (hudlessAvailable != uiCompositionApplied) {
+                active.setUiCompositionEnabled(hudlessAvailable);
+                uiCompositionApplied = hudlessAvailable;
+                SuperResolution.LOGGER.info("[D3D12] XeSS-FG UI composition {}",
+                        hudlessAvailable ? "enabled (HUD-less color tagged)" : "disabled");
+            }
             FrameGenerationMode mode = FrameGeneration.displayedMode();
             boolean hasInputs = mode.isEnabled() && cachedDepth != null
                     && cachedMotionVector != null && presentation != null;
@@ -252,7 +274,8 @@ public final class D3D12FrameGeneration {
                         0.0f, 0.0f, 1.0f, 1.0f,
                         cameraDiscontinuity(), cachedFrameTimeDelta,
                         presentation.depthTexture().address(),
-                        presentation.mvTexture().address());
+                        presentation.mvTexture().address(),
+                        hudlessAvailable ? presentation.hudlessTexture().address() : 0L);
             } else if (enabled) {
                 // Frame generation was switched off, or the depth/motion-vector stream
                 // dropped (e.g. a menu/pause covers the scene); disable interpolation so
@@ -323,11 +346,15 @@ public final class D3D12FrameGeneration {
     public static void writeFrameInputs(D3D12PresentationContext presentationContext) {
         ITexture depth = cachedDepth;
         ITexture mv = cachedMotionVector;
+        ITexture hudless = cachedHudlessColor;
         if (depth != null) {
             InteropResourcesConverter.flipY(depth, presentationContext.depthGlTexture());
         }
         if (mv != null) {
             InteropResourcesConverter.flipMotionVectorY(mv, presentationContext.mvGlTexture());
+        }
+        if (hudless != null) {
+            InteropResourcesConverter.flipY(hudless, presentationContext.hudlessGlTexture());
         }
     }
 
@@ -394,8 +421,10 @@ public final class D3D12FrameGeneration {
         presentation = null;
         cachedDepth = null;
         cachedMotionVector = null;
+        cachedHudlessColor = null;
         cachedFrameTimeDelta = 0.0f;
         lastCameraStateValid = false;
+        uiCompositionApplied = false;
     }
 
     /**

@@ -37,7 +37,9 @@ public interface D3D12FrameGenerationProvider extends FrameGenerationProvider {
      * {@code viewMatrix}/{@code projectionMatrix} are 16-float row-major arrays without
      * applied jitter; {@code frameRenderTimeMs} paces the interpolated frames;
      * {@code depthResource}/{@code motionVectorResource} are {@code ID3D12Resource*}
-     * addresses on the presentation device, or 0 when not yet available.
+     * addresses on the presentation device, or 0 when not yet available;
+     * {@code hudlessResource} is the pre-UI color resource for UI composition, or 0 when
+     * the frame has no HUD-less color (UI composition is toggled separately).
      */
     void prepareD3D12Present(
             int presentId,
@@ -50,7 +52,16 @@ public interface D3D12FrameGenerationProvider extends FrameGenerationProvider {
             boolean resetHistory,
             float frameRenderTimeMs,
             long depthResource,
-            long motionVectorResource);
+            long motionVectorResource,
+            long hudlessResource);
+
+    /**
+     * Enables or disables XeSS-FG UI composition (interpolating the HUD-less color and
+     * compositing the UI instead of interpolating the UI itself). Called when the
+     * HUD-less color availability changes.
+     */
+    default void setUiCompositionEnabled(boolean enabled) {
+    }
 
     /**
      * Updates the extent reported when tagging depth/motion-vector resources; called after
