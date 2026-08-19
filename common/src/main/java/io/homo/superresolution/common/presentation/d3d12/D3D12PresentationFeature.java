@@ -90,6 +90,11 @@ public final class D3D12PresentationFeature {
             disableAfterFailure(throwable);
             return false;
         }
+        // The game calls setVsync() before the D3D12 context exists (it only fills the
+        // static field then), so the freshly created context must be re-synced to the
+        // current setting — otherwise a window created with vsync off still presents
+        // with flip-model syncInterval 1 and stays locked at the monitor refresh rate.
+        context.setVsync(vsync);
         // The window was created hidden (GLFW_VISIBLE=false) by the presentation
         // window mixin; show it now that the swap chain is ready.
         GLFW.glfwShowWindow(window);

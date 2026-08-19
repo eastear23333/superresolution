@@ -20,6 +20,7 @@ import io.homo.superresolution.core.graphics.impl.texture.TextureDescription;
 import io.homo.superresolution.core.graphics.impl.texture.TextureFormat;
 import io.homo.superresolution.core.graphics.impl.texture.TextureType;
 import io.homo.superresolution.core.graphics.impl.texture.TextureUsages;
+import io.homo.superresolution.core.graphics.opengl.GlState;
 import io.homo.superresolution.srapi.SRSurfaceFormat;
 import org.lwjgl.opengl.EXTMemoryObject;
 import org.lwjgl.opengl.EXTMemoryObjectWin32;
@@ -83,7 +84,13 @@ public final class D3D12PresentationContext implements AutoCloseable {
     private final MemorySegment queue;
     private MemorySegment swapchain;
     private MemorySegment factory;
-    private final MemorySegment commandAllocator;
+    /** Ring depth for command allocators: only submits older than this are waited on, so the
+     * render thread never blocks on the current frame's GPU work (mirrors the Vulkan
+     * presentation's {@code MAX_IN_FLIGHT_FRAMES} ring that waits N-1 frames back). */
+    private static final int COMMAND_RING_DEPTH = 3;
+    private final MemorySegment[] commandAllocators;
+    private final long[] commandRingFences = new long[COMMAND_RING_DEPTH];
+    private int commandRingSlot;
     private final MemorySegment commandList;
     private final MemorySegment fence;
     private MemorySegment captureTexture;
@@ -110,7 +117,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
 
     private D3D12PresentationContext(
             Arena arena, long hwnd, MemorySegment device, MemorySegment queue, MemorySegment swapchain,
-            MemorySegment factory, MemorySegment commandAllocator, MemorySegment commandList,
+            MemorySegment factory, MemorySegment[] commandAllocators, MemorySegment commandList,
             MemorySegment fence, MemorySegment captureTexture, long captureAllocationSize,
             GlD3D12ImportableTexture2D captureGlTexture,
             MemorySegment depthTexture, long depthAllocationSize, GlD3D12ImportableTexture2D depthGlTexture,
@@ -122,7 +129,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.queue = queue;
         this.swapchain = swapchain;
         this.factory = factory;
-        this.commandAllocator = commandAllocator;
+        this.commandAllocators = commandAllocators;
         this.commandList = commandList;
         this.fence = fence;
         this.captureTexture = captureTexture;
@@ -202,15 +209,18 @@ public final class D3D12PresentationContext implements AutoCloseable {
             diagnoseSwapchainHook(swapchainPtr);
             diagnoseNativeEntryHooks();
 
-            MemorySegment ppAllocator = arena.allocate(ADDRESS);
-            checkHr(device.CreateCommandAllocator(
-                    windows.win32.graphics.direct3d12.D3D12_COMMAND_LIST_TYPE.DIRECT,
-                    windows.win32.graphics.direct3d12.ID3D12CommandAllocator.iid(), ppAllocator));
-            MemorySegment allocatorPtr = ppAllocator.get(ADDRESS, 0);
+            MemorySegment[] allocators = new MemorySegment[COMMAND_RING_DEPTH];
+            for (int i = 0; i < COMMAND_RING_DEPTH; i++) {
+                MemorySegment ppAllocator = arena.allocate(ADDRESS);
+                checkHr(device.CreateCommandAllocator(
+                        windows.win32.graphics.direct3d12.D3D12_COMMAND_LIST_TYPE.DIRECT,
+                        windows.win32.graphics.direct3d12.ID3D12CommandAllocator.iid(), ppAllocator));
+                allocators[i] = ppAllocator.get(ADDRESS, 0);
+            }
             MemorySegment ppList = arena.allocate(ADDRESS);
             checkHr(device.CreateCommandList(
                     0, windows.win32.graphics.direct3d12.D3D12_COMMAND_LIST_TYPE.DIRECT,
-                    allocatorPtr, MemorySegment.NULL,
+                    allocators[0], MemorySegment.NULL,
                     windows.win32.graphics.direct3d12.ID3D12GraphicsCommandList.iid(), ppList));
             MemorySegment listPtr = ppList.get(ADDRESS, 0);
             checkHr(windows.win32.graphics.direct3d12.ID3D12GraphicsCommandList.wrap(listPtr)
@@ -261,7 +271,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
 
             return new D3D12PresentationContext(
                     arena, hwnd, devicePtr, queuePtr, swapchainPtr, ppFactory.get(ADDRESS, 0),
-                    allocatorPtr, listPtr, fencePtr,
+                    allocators, listPtr, fencePtr,
                     captureTexture, allocationSize, captureGlTexture,
                     depthTexture, depthSize, depthGlTexture,
                     mvTexture, mvSize, mvGlTexture,
@@ -464,9 +474,12 @@ public final class D3D12PresentationContext implements AutoCloseable {
         // The GL work below (semaphore layout barriers + flipY compute) must not leak
         // GL state into the next frame: the Vulkan path wraps it in a GlState, and without
         // that the leaked texture-unit/program state makes font rendering sample the wrong
-        // atlas (purple/black missing-texture stripes).
-        try (io.homo.superresolution.core.graphics.opengl.GlState ignored =
-                     new io.homo.superresolution.core.graphics.opengl.GlState()) {
+        // atlas (purple/black missing-texture stripes). The flip path only touches the
+        // program, the active texture unit and texture bindings, so save just those
+        // (~4 glGet instead of ~75): glGet is a driver sync point, and a STATE_ALL save
+        // per frame adds CPU serialization that the Vulkan presentation does not have.
+        long flipStateMask = GlState.STATE_PROGRAM | GlState.STATE_ACTIVE_TEXTURE | GlState.STATE_TEXTURE;
+        try (GlState ignored = new GlState(flipStateMask)) {
             if (lastD3d12Signal > 0) {
                 semaphore.waitFor(
                         lastD3d12Signal,
@@ -501,12 +514,21 @@ public final class D3D12PresentationContext implements AutoCloseable {
             windows.win32.graphics.dxgi.IDXGISwapChain3 swapchainIface =
                     windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain);
 
+            // Recycle the oldest command-allocator slot: wait only for the submit made
+            // COMMAND_RING_DEPTH-1 frames ago (queue execution is FIFO, so that covers this
+            // slot's previous commit). Never wait on the current frame — that zero-pipeline
+            // stall is what starved the GPU below the Vulkan presentation.
+            int ringSlot = acquireCommandRingSlot(fenceIface);
+
+            // GPU-side ordering: queue waits for the GL flipY barrier+signal (shared fence)
+            // before the copy below; this does not block the CPU.
             queueIface.Wait(fence, captureValue);
 
-            checkHr(windows.win32.graphics.direct3d12.ID3D12CommandAllocator.wrap(commandAllocator)
+            checkHr(windows.win32.graphics.direct3d12.ID3D12CommandAllocator
+                    .wrap(commandAllocators[ringSlot])
                     .Reset());
             checkHr(windows.win32.graphics.direct3d12.ID3D12GraphicsCommandList.wrap(commandList)
-                    .Reset(commandAllocator, MemorySegment.NULL));
+                    .Reset(commandAllocators[ringSlot], MemorySegment.NULL));
 
             int imageIndex = swapchainIface.GetCurrentBackBufferIndex();
             MemorySegment backBuffer = cachedBackBuffer(frameArena, swapchainIface, imageIndex);
@@ -574,11 +596,9 @@ public final class D3D12PresentationContext implements AutoCloseable {
             checkHr(listIface().Close());
             queueIface.ExecuteCommandLists(1, frameArena.allocateFrom(ADDRESS, commandList));
 
-            // Wait until the GL flipY has actually completed on the GPU (fence >= captureValue)
-            // before presenting; presenting through this same queue is FIFO-ordered after the
-            // copy, this wait guards the frame pacing of the Present call itself. Event-based
-            // (no 1ms polling); falls back to polling when kernel32 is not bindable.
-            waitForFlipY(fenceIface, captureValue);
+            // The copy above is FIFO-ordered after the GL flipY by the queue Wait, so no CPU
+            // wait on the current frame's GPU work is needed (pacing comes from the flip-model
+            // Present below).
 
             // Stamp the present latency markers. The Vulkan swapchain does this in its own
             // present path; the D3D12 presentation has no equivalent hook, so do it here for
@@ -591,6 +611,10 @@ public final class D3D12PresentationContext implements AutoCloseable {
             if (presentResult != 0) {
                 io.homo.superresolution.common.SuperResolution.LOGGER.warn(
                         "[D3D12] present result=0x{}", Integer.toHexString(presentResult));
+                // The fence-ring fast path never polls the fence, so a removed device only
+                // surfaces here or in the next ring-slot wait: report it, stop frame
+                // generation and let the presentation feature fall back.
+                checkDeviceRemoved(fenceIface);
             } else {
                 io.homo.superresolution.common.SuperResolution.LOGGER.debug("[D3D12] present ok");
             }
@@ -599,6 +623,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
             long signalValue = nextGlFence + 1;
             queueIface.Signal(fence, signalValue);
             lastD3d12Signal = signalValue;
+            commandRingFences[ringSlot] = signalValue;
             nextGlFence += 2;
         }
     }
@@ -646,20 +671,37 @@ public final class D3D12PresentationContext implements AutoCloseable {
     }
 
     /**
-     * Blocks until {@code fenceIface} reaches {@code captureValue} (bounded ~2s) using the
-     * fence completion event, falling back to polling when kernel32 cannot be bound. Logs a
-     * warning (and reports device removal) on timeout.
+     * Advances the command-allocator ring and waits only for this slot's previous submit
+     * (i.e. the submit from {@code COMMAND_RING_DEPTH-1} frames ago). Returns the slot to
+     * use. A timeout or a removed device ({@code GetCompletedValue == UINT64_MAX}) throws
+     * so the presentation feature can disable the D3D12 path instead of hanging.
      */
-    private void waitForFlipY(windows.win32.graphics.direct3d12.ID3D12Fence fenceIface, long captureValue) {
-        if (fenceIface.GetCompletedValue() >= captureValue) {
+    private int acquireCommandRingSlot(windows.win32.graphics.direct3d12.ID3D12Fence fenceIface) {
+        int slot = commandRingSlot;
+        commandRingSlot = (commandRingSlot + 1) % COMMAND_RING_DEPTH;
+        long pending = commandRingFences[slot];
+        if (pending > 0L && fenceIface.GetCompletedValue() < pending) {
+            waitOnFence(fenceIface, pending, "command ring slot " + slot);
+        }
+        return slot;
+    }
+
+    /**
+     * Blocks until {@code fenceIface} reaches {@code value} (bounded ~2s) using the fence
+     * completion event, falling back to polling when kernel32 cannot be bound. A timeout
+     * throws (device removal when the fence reads as removed) instead of letting the next
+     * present spin forever.
+     */
+    private void waitOnFence(windows.win32.graphics.direct3d12.ID3D12Fence fenceIface, long value, String what) {
+        if (fenceIface.GetCompletedValue() >= value) {
             return;
         }
         if (CREATE_EVENT != null && WAIT_SINGLE_OBJECT != null && ensureFenceEvent()) {
             try {
-                checkHr(fenceIface.SetEventOnCompletion(captureValue, fenceEvent));
+                checkHr(fenceIface.SetEventOnCompletion(value, fenceEvent));
                 // Bounded like the old polling loop; the auto-reset event covers retries.
                 long deadline = System.nanoTime() + 2_000_000_000L;
-                while (fenceIface.GetCompletedValue() < captureValue
+                while (fenceIface.GetCompletedValue() < value
                         && System.nanoTime() < deadline) {
                     // remaining ms, at least 1
                     int remaining = (int) Math.max(1,
@@ -669,18 +711,31 @@ public final class D3D12PresentationContext implements AutoCloseable {
             } catch (Throwable throwable) {
                 io.homo.superresolution.common.SuperResolution.LOGGER.debug(
                         "[D3D12] fence event wait failed; polling", throwable);
-                pollFlipY(fenceIface, captureValue);
+                pollFence(fenceIface, value);
             }
         } else {
-            pollFlipY(fenceIface, captureValue);
+            pollFence(fenceIface, value);
         }
-        reportFlipYTimeout(fenceIface, captureValue);
+        long completedAfterWait = fenceIface.GetCompletedValue();
+        if (completedAfterWait < value) {
+            if (completedAfterWait == -1L) {
+                // GetCompletedValue returns UINT64_MAX (reads as -1) when the device is
+                // removed: log the driver's removal reason and stop frame generation.
+                throwDeviceRemoved();
+            }
+            io.homo.superresolution.common.SuperResolution.LOGGER.warn(
+                    "[D3D12] timed out waiting for {} (fence {} completed {})",
+                    what, value, completedAfterWait);
+            // A ring slot that never completes would stall present forever; treat it as
+            // fatal so the presentation feature falls back to OpenGL/Vulkan safely.
+            throw new IllegalStateException("D3D12 fence wait timed out: " + what);
+        }
     }
 
-    private void pollFlipY(
-            windows.win32.graphics.direct3d12.ID3D12Fence fenceIface, long captureValue) {
+    private void pollFence(
+            windows.win32.graphics.direct3d12.ID3D12Fence fenceIface, long value) {
         for (int i = 0; i < 2000; i++) {
-            if (fenceIface.GetCompletedValue() >= captureValue) {
+            if (fenceIface.GetCompletedValue() >= value) {
                 return;
             }
             try {
@@ -692,26 +747,19 @@ public final class D3D12PresentationContext implements AutoCloseable {
         }
     }
 
-    private void reportFlipYTimeout(
-            windows.win32.graphics.direct3d12.ID3D12Fence fenceIface, long captureValue) {
-        long completedAfterWait = fenceIface.GetCompletedValue();
-        if (completedAfterWait < captureValue) {
-            io.homo.superresolution.common.SuperResolution.LOGGER.warn(
-                    "[D3D12] timed out waiting for flipY fence {} (completed {})",
-                    captureValue, completedAfterWait);
-            if (completedAfterWait == -1L) {
-                // GetCompletedValue returns UINT64_MAX (reads as -1) when the device is
-                // removed: the GL semaphore can never signal again, so every later present
-                // would spin in the timeouts above. Log the driver's removal reason and
-                // stop frame generation; throwing lets the presentation feature disable
-                // the D3D12 path instead of hanging on the loading screen forever.
-                int removalReason = windows.win32.graphics.direct3d12.ID3D12Device.wrap(device)
-                        .GetDeviceRemovedReason();
-                D3D12FrameGeneration.onDeviceRemoved(removalReason);
-                throw new IllegalStateException("D3D12 device removed (reason 0x"
-                        + Integer.toHexString(removalReason) + ")");
-            }
+    /** Reports and throws on device removal; called where the fast path would miss it. */
+    private void checkDeviceRemoved(windows.win32.graphics.direct3d12.ID3D12Fence fenceIface) {
+        if (fenceIface.GetCompletedValue() == -1L) {
+            throwDeviceRemoved();
         }
+    }
+
+    private void throwDeviceRemoved() {
+        int removalReason = windows.win32.graphics.direct3d12.ID3D12Device.wrap(device)
+                .GetDeviceRemovedReason();
+        D3D12FrameGeneration.onDeviceRemoved(removalReason);
+        throw new IllegalStateException("D3D12 device removed (reason 0x"
+                + Integer.toHexString(removalReason) + ")");
     }
 
     private boolean ensureFenceEvent() {
