@@ -20,6 +20,7 @@ import io.homo.superresolution.common.framegeneration.FrameGeneration;
 import io.homo.superresolution.common.minecraft.MinecraftUtils;
 import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;
+import io.homo.superresolution.common.lowlatency.xell.XeLLowLatency;
 import io.homo.superresolution.core.graphics.vulkan.VulkanLowLatency;
 import io.homo.superresolution.core.streamline.Streamline;
 import net.minecraft.client.Minecraft;
@@ -33,6 +34,8 @@ public final class LowLatency {
     private static @Nullable LowLatencyDescription activeBackend;
     private static @Nullable LowLatencyProvider lowLatency;
     private static volatile long currentLatencyFrameId;
+    /** Logged once when the XeLL session quarantine engages. */
+    private static boolean reportedXellQuarantine;
 
     static {
         LowLatencyDescriptions.register();
@@ -182,6 +185,11 @@ public final class LowLatency {
 
     public static synchronized void shutdown() {
         releaseProvider();
+        // Tear down the resident XeLL context. Only runs at game shutdown, after
+        // D3D12PresentationFeature.shutdown() has already destroyed XeSS-FG, so the
+        // required order (XeFG destroy before XeLL destroy) holds. Idempotent no-op
+        // when XeLL is inactive or was already destroyed by the presentation shutdown.
+        XeLLowLatency.destroy();
         activeBackend = null;
         mode = null;
     }
@@ -194,6 +202,22 @@ public final class LowLatency {
      */
     private static void renegotiate() {
         String targetBackendId = FrameGeneration.activeLowLatencyBackendId();
+        // Session quarantine: once a XeLL context has been torn down it cannot be created
+        // again in this process (xellSetAppQueue fails with -1000 on the second context).
+        // Re-creating it would re-arm the doomed XeSS-FG takeover retry, whose failure
+        // chain (XeFG init -15 -> swap chain restore on a removed device -> disable ->
+        // frozen GLFW_NO_API window) froze the game with GLFW_NO_WINDOW_CONTEXT (65546)
+        // spam. Keep XeLL off until the game restarts instead.
+        if (XeLLowLatency.wasDestroyed()
+                && LowLatencyDescriptions.XELL_BACKEND_ID.equals(targetBackendId)) {
+            if (!reportedXellQuarantine) {
+                reportedXellQuarantine = true;
+                SuperResolution.LOGGER.warn(
+                        "XeLL was torn down this session and cannot be re-created in-process "
+                                + "(second xellSetAppQueue fails); low latency stays off until restart");
+            }
+            targetBackendId = "";
+        }
         LowLatencyDescription target = targetBackendId.isEmpty()
                 ? null
                 : LowLatencyRegistry.getDescriptionById(targetBackendId);

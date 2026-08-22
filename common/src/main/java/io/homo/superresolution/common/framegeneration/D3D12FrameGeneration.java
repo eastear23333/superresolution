@@ -74,8 +74,22 @@ public final class D3D12FrameGeneration {
     private static ITexture cachedHudlessColor;
     /** Whether UI composition is currently enabled on the provider. */
     private static boolean uiCompositionApplied;
-    /** Last frame time delta from the dispatch event, passed as frameRenderTime (ms). */
+    /**
+     * Last frame time delta from the dispatch event, in NANOSECONDS
+     * (PerformanceTracker.getLastResultCPU("Frame") stores System.nanoTime() deltas).
+     * Converted to milliseconds right before tagging the XeSS-FG frame constants, which
+     * expect frameRenderTime in ms (the previous code passed raw nanoseconds — a 1e6x
+     * overshoot that pushed the SDK's interpolation timing far outside the real frame
+     * cadence and contributed ghost-like overlays in low-texture/dark regions).
+     */
     private static float cachedFrameTimeDelta;
+    /**
+     * True vertical FOV (degrees) of the render projection, taken from the dispatch event
+     * (Iris gbufferProjection, m11-derived) so the rebuilt XeSS-FG projection matches the
+     * actual depth/motion-vector rendering instead of the vanilla-only fallback FOV.
+     * &lt;=0 when no dispatch has arrived yet (fall back to MinecraftCameraState.fov).
+     */
+    private static float cachedFovDegrees = -1f;
     /** Last multiplier pushed to the provider; re-synced from the config each present. */
     private static int appliedInterpolatedFrames = -1;
     /** Presentation extent last pushed to the provider's tagged resource size. */
@@ -119,6 +133,10 @@ public final class D3D12FrameGeneration {
         cachedMotionVector = resources.motionVectorsTexture();
         cachedHudlessColor = resources.colorTexture();
         cachedFrameTimeDelta = event.getDispatchResource().frameTimeDelta();
+        float projectedFov = event.getDispatchResource().verticalFov();
+        if (!Float.isNaN(projectedFov) && projectedFov > 0f) {
+            cachedFovDegrees = projectedFov;
+        }
         if (inputsChanged) {
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG dispatch: depth={} motionVector={} hudlessColor={}",
                     depthPresent, mvPresent, hudlessPresent);
@@ -135,6 +153,17 @@ public final class D3D12FrameGeneration {
     public static synchronized void initialize(D3D12PresentationContext presentationContext) {
         presentation = presentationContext;
         if (provider != null) {
+            return;
+        }
+        // Session quarantine: XeLL was already torn down this session and cannot re-register
+        // its app queue in-process (xellSetAppQueue -1000). A takeover attempt would fail
+        // (xefgSwapChainD3D12InitFromSwapChainDesc -15) and the failure restore has removed
+        // the D3D12 device (0x887A0005), disabling the presentation and freezing the
+        // GLFW_NO_API window. Stay in passthrough on the restored plain swap chain.
+        if (XeLLowLatency.wasDestroyed()) {
+            pendingInit = false;
+            SuperResolution.LOGGER.info(
+                    "[D3D12] XeSS-FG skipped: XeLL torn down this session; restart to re-enable");
             return;
         }
         // D3D12 activation flips which FG backends are supported; the registry caches
@@ -272,7 +301,7 @@ public final class D3D12FrameGeneration {
                 active.prepareD3D12Present(
                         xefgFrameId, viewMatrix(), projectionMatrix(),
                         0.0f, 0.0f, 1.0f, 1.0f,
-                        cameraDiscontinuity(), cachedFrameTimeDelta,
+                        cameraDiscontinuity(), frameRenderTimeMs(cachedFrameTimeDelta),
                         presentation.depthTexture().address(),
                         presentation.mvTexture().address(),
                         hudlessAvailable ? presentation.hudlessTexture().address() : 0L);
@@ -433,8 +462,13 @@ public final class D3D12FrameGeneration {
      * the connected XeLL context (and the shared libxell.dll) even in passthrough mode
      * (frame-generation mode OFF only disables interpolation), so destroying XeLL
      * underneath a live XeSS-FG context crashes the next Present with a DEP violation
-     * (the XeSS-FG guide requires destroying XeFG before XeLL). The takeover comes back
-     * automatically once a new XeLL context exists.
+     * (the XeSS-FG guide requires destroying XeFG before XeLL).
+     *
+     * <p>The takeover does NOT come back in this session: XeLL cannot register its app
+     * queue on a second in-process context (xellSetAppQueue -1000), and re-arming the
+     * retry produced a failed XeSS-FG takeover that removed the D3D12 device
+     * (0x887A0005), disabled the presentation and froze the GLFW_NO_API window. A game
+     * restart is required to re-enable XeSS-FG.</p>
      */
     public static synchronized void teardownForLowLatencyShutdown() {
         D3D12PresentationContext presentationContext = presentation;
@@ -445,12 +479,13 @@ public final class D3D12FrameGeneration {
         try {
             presentationContext.recreateSwapchain(
                     presentationContext.width(), presentationContext.height());
-            // Keep the presentation and arm the deferred retry so the takeover resumes
-            // when a new XeLL context appears (XeLL re-enabled).
+            // Keep the presentation on the restored plain swap chain; do not re-arm the
+            // takeover (XeLL cannot re-create in-process, see the class note above).
             presentation = presentationContext;
-            pendingInit = true;
+            pendingInit = false;
             SuperResolution.LOGGER.info(
-                    "[D3D12] XeSS-FG torn down before XeLL shutdown; swap chain restored");
+                    "[D3D12] XeSS-FG torn down before XeLL shutdown; swap chain restored "
+                            + "(XeSS-FG stays off until restart)");
         } catch (Throwable throwable) {
             SuperResolution.LOGGER.error(
                     "[D3D12] XeSS-FG teardown swap chain restore failed", throwable);
@@ -485,13 +520,26 @@ public final class D3D12FrameGeneration {
     }
 
     /**
+     * Converts the cached dispatch frame-time delta (nanoseconds) to the milliseconds that
+     * XeSS-FG's frameRenderTime constant expects. Non-positive deltas (first frame, or no
+     * completed "Frame" sample yet) tag as 0 ms so the SDK treats the frame as the stream
+     * start rather than an absurdly long interval.
+     */
+    private static float frameRenderTimeMs(float frameTimeDeltaNanos) {
+        return frameTimeDeltaNanos > 0f ? frameTimeDeltaNanos / 1_000_000.0f : 0f;
+    }
+
+    /**
      * Row-major perspective projection (DirectX convention, Z in [0,1]) built from the
-     * Minecraft camera FOV. The Minecraft render projection is not reachable from this
-     * facade (1.21.11 has no RenderSystem#getProjectionMatrix), and the FOV/eye-depth
-     * conventions are reconciled when the depth/motion-vector capture lands (next phase).
+     * render FOV. Prefers the dispatch-captured true vertical FOV (from the Iris
+     * gbufferProjection that produced the depth/motion-vector buffers); falls back to the
+     * vanilla camera FOV while no dispatch has arrived.
      */
     private static float[] projectionMatrix() {
-        float fovDegrees = MinecraftCameraState.fov;
+        float fovDegrees = cachedFovDegrees;
+        if (fovDegrees <= 0.0f) {
+            fovDegrees = MinecraftCameraState.fov;
+        }
         if (fovDegrees <= 0.0f) {
             fovDegrees = 70.0f; // Minecraft default FOV fallback
         }

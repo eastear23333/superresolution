@@ -633,16 +633,29 @@ public final class D3D12PresentationContext implements AutoCloseable {
             // If XeSS-FG took over the swap chain, tag constants and set the present id right
             // before Present so the proxy can generate interpolated frames.
             D3D12FrameGeneration.beforePresent();
-            int presentResult = presentSwapchain(swapchain, vsync);
-            if (presentResult != 0) {
+            // Guard the XeLL/XeFG teardown-takeover cycle: beforePresent can release the
+            // swap chain mid-present (releaseSwapchain sets the field to MemorySegment.NULL),
+            // and when the takeover restore also fails the field stays NULL while
+            // disableAfterFailure shuts the context down. Presenting through that NULL
+            // handle dereferences address 0 in the IDXGISwapChain vtbl (AV 0xc0000005,
+            // render thread, right after the libxess_fg.dll unload). Skip this frame's
+            // Present; the fence signal below still advances the command ring, and
+            // disableAfterFailure stops any further present.
+            if (swapchain == null || swapchain.address() == 0L) {
                 io.homo.superresolution.common.SuperResolution.LOGGER.warn(
-                        "[D3D12] present result=0x{}", Integer.toHexString(presentResult));
-                // The fence-ring fast path never polls the fence, so a removed device only
-                // surfaces here or in the next ring-slot wait: report it, stop frame
-                // generation and let the presentation feature fall back.
-                checkDeviceRemoved(fenceIface);
+                        "[D3D12] present skipped: swap chain released mid-frame (XeSS-FG/XeLL teardown)");
             } else {
-                io.homo.superresolution.common.SuperResolution.LOGGER.debug("[D3D12] present ok");
+                int presentResult = presentSwapchain(swapchain, vsync);
+                if (presentResult != 0) {
+                    io.homo.superresolution.common.SuperResolution.LOGGER.warn(
+                            "[D3D12] present result=0x{}", Integer.toHexString(presentResult));
+                    // The fence-ring fast path never polls the fence, so a removed device only
+                    // surfaces here or in the next ring-slot wait: report it, stop frame
+                    // generation and let the presentation feature fall back.
+                    checkDeviceRemoved(fenceIface);
+                } else {
+                    io.homo.superresolution.common.SuperResolution.LOGGER.debug("[D3D12] present ok");
+                }
             }
             LowLatency.endPresent();
 
@@ -841,6 +854,10 @@ public final class D3D12PresentationContext implements AutoCloseable {
      * takeover is used instead of re-reading the vtable each frame.
      */
     private static int presentSwapchain(MemorySegment swapchain, boolean vsync) {
+        if (swapchain == null || swapchain.address() == 0L) {
+            // Defensive: never walk the vtbl of a released swap chain (AV at 0x0).
+            return 0;
+        }
         long fn = cachedXefgPresentFn;
         if (fn == 0L) {
             // No XeSS-FG takeover yet: present through the plain vtable like before.

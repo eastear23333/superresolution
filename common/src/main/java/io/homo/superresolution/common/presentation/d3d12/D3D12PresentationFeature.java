@@ -17,6 +17,7 @@ import io.homo.superresolution.common.config.SuperResolutionConfig;
 import io.homo.superresolution.common.config.enums.PresentationMode;
 import io.homo.superresolution.common.framegeneration.D3D12FrameGeneration;
 import io.homo.superresolution.common.lowlatency.LowLatency;
+import io.homo.superresolution.common.lowlatency.xell.XeLLowLatency;
 import io.homo.superresolution.common.minecraft.MinecraftWindow;
 import io.homo.superresolution.core.graphics.d3d12.D3D12PresentationContext;
 import io.homo.superresolution.core.graphics.impl.framebuffer.FrameBufferAttachmentType;
@@ -170,8 +171,13 @@ public final class D3D12PresentationFeature {
     }
 
     public static synchronized void shutdown() {
-        // XeSS-FG must be torn down before the D3D12 device/swap chain it borrowed.
+        // XeSS-FG must be torn down before the D3D12 device/swap chain it borrowed, and
+        // before the XeLL context it is connected to (XeFG destroy precedes XeLL destroy).
         D3D12FrameGeneration.shutdown();
+        // The resident XeLL context borrows the D3D12 device; kill it before releasing
+        // the device below. Idempotent: the game-exit path (LowLatency.shutdown) runs
+        // after this method and finds nothing left to destroy.
+        XeLLowLatency.destroy();
         if (context != null) {
             context.close();
             context = null;
@@ -181,6 +187,13 @@ public final class D3D12PresentationFeature {
 
     public static synchronized void disableAfterFailure(Throwable failure) {
         SuperResolution.LOGGER.error("Disabling D3D12 presentation after failure", failure);
+        // Hard limitation: the Minecraft window was created GLFW_NO_API (no GL context)
+        // and the render system only has the hidden 1x1 GL helper window, so once the
+        // D3D12 presentation is disabled nothing can present to the screen again — the
+        // window freezes on its last frame until the game restarts, and Minecraft's own
+        // swapBuffers starts reporting GLFW_NO_WINDOW_CONTEXT (65546). The XeLL/XeSS-FG
+        // session quarantine (LowLatency.renegotiate / D3D12FrameGeneration) is what
+        // keeps the teardown-recreate cascade from landing here.
         failed = true;
         shutdown();
     }

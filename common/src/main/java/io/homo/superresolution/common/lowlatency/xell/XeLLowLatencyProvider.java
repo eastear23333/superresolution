@@ -13,7 +13,6 @@ package io.homo.superresolution.common.lowlatency.xell;
 import io.homo.superresolution.api.registry.LowLatencyMarker;
 import io.homo.superresolution.api.registry.LowLatencyProvider;
 import io.homo.superresolution.common.SuperResolution;
-import io.homo.superresolution.common.framegeneration.D3D12FrameGeneration;
 import io.homo.superresolution.common.lowlatency.LowLatency;
 import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.core.NativeLibManager;
@@ -44,9 +43,13 @@ import static java.lang.foreign.ValueLayout.JAVA_INT;
  * backend in Wisteria can connect to it later via {@code xefgSwapChainSetLatencyReduction}
  * (XeLL must outlive the XeSS-FG context).</p>
  *
- * <p>Markers and sleep are driven by the shared low-latency hooks ({@link LowLatency});
- * D3D12 presentation also stamps present-start/end since those live in the swapchain
- * present path rather than the Vulkan swapchain.</p>
+ * <p>The context is deliberately <em>resident</em> across low-latency toggles:
+ * {@link #release()} never destroys it (a second in-process context cannot register
+ * its app queue, xellSetAppQueue -1000), so later provider instances reuse it and only
+ * the real shutdown path — {@link XeLLowLatency#destroy()}, after XeSS-FG is torn
+ * down — tears it down. Markers and sleep are driven by the shared low-latency hooks
+ * ({@link LowLatency}); D3D12 presentation also stamps present-start/end since those
+ * live in the swapchain present path rather than the Vulkan swapchain.</p>
  */
 public final class XeLLowLatencyProvider implements LowLatencyProvider {
     /** xell_latency_marker_type_t values (xell.h). */
@@ -70,6 +73,8 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
     private final MethodHandle setSleepMode;
     private final MethodHandle sleep;
     private final MethodHandle addMarkerData;
+    /** True when this instance created the resident context (and stashed its destroy path). */
+    private final boolean ownsContext;
 
     /** Last applied minimum frame interval; refresh() only re-applies when it changes. */
     private volatile int appliedFrameIntervalUs = Integer.MIN_VALUE;
@@ -81,6 +86,7 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
         MethodHandle setSleepMode = null;
         MethodHandle sleep = null;
         MethodHandle addMarkerData = null;
+        boolean ownsContext = false;
         try {
             Path dllPath = NativeLibManager.LIB_SUPER_RESOLUTION_XELL
                     .getTargetPath(SuperResolutionConstants.NATIVE_LIBRARIES_DIR.getPath())
@@ -112,18 +118,36 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
                     library.find("xellAddMarkerData").orElseThrow(),
                     FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT));
 
-            MemorySegment pContext = arena.allocate(ADDRESS);
-            int result = (int) createContext.invokeExact(device, pContext);
-            if (result != 0) {
-                throw new IllegalStateException(
-                        "xellD3D12CreateContext failed with code " + result
-                                + " (GPU or driver may not support XeLL)");
+            MemorySegment existing = XeLLowLatency.context();
+            if (existing != null && existing.address() != 0L) {
+                // Reuse the resident context from an earlier toggle. XeLL cannot register
+                // its app queue on a second in-process context (xellSetAppQueue -1000),
+                // so the context is created exactly once; the owning arena and destroy
+                // handle were stashed in XeLLowLatency by its creator. Only this
+                // provider's own symbol arenas/handles are fresh (same DLL, refcounted).
+                context = existing;
+            } else {
+                MemorySegment pContext = arena.allocate(ADDRESS);
+                int result = (int) createContext.invokeExact(device, pContext);
+                if (result != 0) {
+                    throw new IllegalStateException(
+                            "xellD3D12CreateContext failed with code " + result
+                                    + " (GPU or driver may not support XeLL)");
+                }
+                context = pContext.get(ADDRESS, 0);
+                ownsContext = true;
+                // Hand the resident context's destroy path to the global holder so later
+                // provider instances can reuse it without owning it. Only attach after
+                // everything above succeeded: a failure must not leave the holder pointing
+                // at an arena this ctor is about to close.
+                XeLLowLatency.attach(arena, destroyContext);
+                XeLLowLatency.setContext(context);
             }
-            context = pContext.get(ADDRESS, 0);
             appliedFrameIntervalUs = LowLatency.frameLimitUs();
             applySleepMode(arena, context, setSleepMode, appliedFrameIntervalUs);
-            XeLLowLatency.setContext(context);
-            SuperResolution.LOGGER.info("[XeLL] context created");
+            SuperResolution.LOGGER.info(ownsContext
+                    ? "[XeLL] context created"
+                    : "[XeLL] reusing resident context");
         } catch (Throwable throwable) {
             SuperResolution.LOGGER.error("[XeLL] initialization failed", throwable);
             if (arena != null) {
@@ -135,6 +159,7 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
             setSleepMode = null;
             sleep = null;
             addMarkerData = null;
+            ownsContext = false;
         }
         this.arena = arena;
         this.context = context;
@@ -142,6 +167,7 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
         this.setSleepMode = setSleepMode;
         this.sleep = sleep;
         this.addMarkerData = addMarkerData;
+        this.ownsContext = ownsContext;
     }
 
     @Override
@@ -202,27 +228,23 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
 
     @Override
     public void release() {
-        // XeSS-FG must be torn down before the XeLL context dies: its proxy Present uses
-        // the connected XeLL context (and this shared libxell.dll) even in passthrough
-        // mode, so destroying XeLL underneath a live takeover crashes the next Present
-        // (DEP violation; the XeSS-FG guide requires XeFG destroy before XeLL destroy).
-        // No-op when no takeover is active; idempotent for the game-shutdown path.
-        D3D12FrameGeneration.teardownForLowLatencyShutdown();
-        if (context != null && context.address() != 0L && destroyContext != null) {
-            try {
-                int result = (int) destroyContext.invokeExact(context);
-                if (result != 0) {
-                    SuperResolution.LOGGER.debug("[XeLL] destroyContext returned {}", result);
-                }
-            } catch (Throwable throwable) {
-                SuperResolution.LOGGER.warn("[XeLL] destroyContext failed", throwable);
-            }
-        }
-        XeLLowLatency.setContext(null);
-        if (arena != null) {
+        // Soft release: the XeLL context intentionally stays resident across low-latency
+        // toggles. Destroying it here forced XeSS-FG to tear down and re-take-over the
+        // swap chain, but a second in-process XeLL context cannot register its app queue
+        // (xellSetAppQueue -1000), and the failed re-takeover (xefgSwapChainD3D12InitFromSwapChainDesc
+        // -15 → swap-chain restore on a removed device 0x887A0005) disabled the D3D12
+        // presentation and froze the GLFW_NO_API window. The resident context (with its
+        // owning arena and destroy handle) lives in {@link XeLLowLatency} and is torn
+        // down there on real shutdown — game exit (after D3D12PresentationFeature.shutdown
+        // destroyed XeSS-FG) or the D3D12 presentation closing — so the XeFG-before-XeLL
+        // order always holds. Reused providers only close their own symbol arena here;
+        // the owner keeps its arena open (XeLLowLatency owns it).
+        if (!ownsContext && arena != null) {
             arena.close();
+            SuperResolution.LOGGER.info("[XeLL] released reused provider (context stays resident)");
+        } else if (ownsContext) {
+            SuperResolution.LOGGER.info("[XeLL] toggle release: context stays resident until shutdown");
         }
-        SuperResolution.LOGGER.info("[XeLL] context destroyed");
     }
 
     /** The current SR frame id truncated to XeLL's uint32 frame counter. */
