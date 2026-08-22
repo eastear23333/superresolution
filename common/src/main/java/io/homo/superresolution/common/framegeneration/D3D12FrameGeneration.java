@@ -26,11 +26,21 @@ import io.homo.superresolution.common.minecraft.MinecraftUtils;
 import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
 import io.homo.superresolution.common.upscale.InteropResourcesConverter;
 import io.homo.superresolution.core.graphics.d3d12.D3D12PresentationContext;
+import io.homo.superresolution.core.graphics.impl.framebuffer.FrameBufferAttachmentType;
+import io.homo.superresolution.core.graphics.impl.framebuffer.IFrameBuffer;
 import io.homo.superresolution.core.graphics.impl.texture.ITexture;
+import io.homo.superresolution.core.graphics.impl.texture.TextureDescription;
+import io.homo.superresolution.core.graphics.impl.texture.TextureFormat;
+import io.homo.superresolution.core.graphics.impl.texture.TextureType;
+import io.homo.superresolution.core.graphics.impl.texture.TextureUsages;
+import io.homo.superresolution.core.graphics.opengl.Gl;
+import io.homo.superresolution.core.graphics.opengl.texture.GlTexture2D;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
+import org.joml.Vector2f;
 import org.joml.Vector3d;
 import org.joml.Vector3f;
+import org.lwjgl.opengl.GL41;
 
 import java.lang.foreign.MemorySegment;
 
@@ -72,6 +82,22 @@ public final class D3D12FrameGeneration {
     private static ITexture cachedMotionVector;
     /** Pre-UI shader-compat color, tagged as XeSS-FG's HUD-less color for UI composition. */
     private static ITexture cachedHudlessColor;
+    /**
+     * Full-resolution pre-UI scene snapshot taken right before GUI compositing
+     * (FogRenderer.endFrame), used as XeSS-FG's HUDLESS_COLOR input. The shader-compat
+     * dispatch color is the low-resolution pre-upscale render target and must NOT feed
+     * the SDK (it interpolates at back-buffer resolution; a low-res input shows up as a
+     * faint low-res overlay whose size tracks the render-scale factor).
+     */
+    private static ITexture cachedSceneSnapshot;
+    private static int snapshotWidth = -1;
+    private static int snapshotHeight = -1;
+    /**
+     * Render jitter (render-resolution pixels) from the last dispatch event. XeSS-FG
+     * samples the low-res motion vectors at the jittered pixel positions, so the SDK
+     * must receive the same jitter the scene was rendered with.
+     */
+    private static Vector2f cachedJitterOffset = new Vector2f(0.0f, 0.0f);
     /** Whether UI composition is currently enabled on the provider. */
     private static boolean uiCompositionApplied;
     /**
@@ -133,6 +159,7 @@ public final class D3D12FrameGeneration {
         cachedMotionVector = resources.motionVectorsTexture();
         cachedHudlessColor = resources.colorTexture();
         cachedFrameTimeDelta = event.getDispatchResource().frameTimeDelta();
+        cachedJitterOffset = new Vector2f(event.getDispatchResource().jitterOffset());
         float projectedFov = event.getDispatchResource().verticalFov();
         if (!Float.isNaN(projectedFov) && projectedFov > 0f) {
             cachedFovDegrees = projectedFov;
@@ -276,12 +303,12 @@ public final class D3D12FrameGeneration {
             syncConfiguredState(active);
             // Toggle UI composition with the HUD-less color's availability: interpolating
             // the UI itself (semi-transparent Minecraft HUD) produces jelly-like warping.
-            boolean hudlessAvailable = cachedHudlessColor != null && presentation != null;
+            boolean hudlessAvailable = cachedSceneSnapshot != null && presentation != null;
             if (hudlessAvailable != uiCompositionApplied) {
                 active.setUiCompositionEnabled(hudlessAvailable);
                 uiCompositionApplied = hudlessAvailable;
                 SuperResolution.LOGGER.info("[D3D12] XeSS-FG UI composition {}",
-                        hudlessAvailable ? "enabled (HUD-less color tagged)" : "disabled");
+                        hudlessAvailable ? "enabled (scene snapshot tagged)" : "disabled");
             }
             FrameGenerationMode mode = FrameGeneration.displayedMode();
             boolean hasInputs = mode.isEnabled() && cachedDepth != null
@@ -300,7 +327,7 @@ public final class D3D12FrameGeneration {
                         xefgFrameId, enabled);
                 active.prepareD3D12Present(
                         xefgFrameId, viewMatrix(), projectionMatrix(),
-                        0.0f, 0.0f, 1.0f, 1.0f,
+                        cachedJitterOffset.x, cachedJitterOffset.y, 1.0f, 1.0f,
                         cameraDiscontinuity(), frameRenderTimeMs(cachedFrameTimeDelta),
                         presentation.depthTexture().address(),
                         presentation.mvTexture().address(),
@@ -368,22 +395,92 @@ public final class D3D12FrameGeneration {
     }
 
     /**
-     * Copies the cached Iris depth/motion-vector GL textures into the D3D12 presentation's
-     * shared depth/motion-vector textures. Called from the D3D12 present path while
-     * recording the frame's GL work, so the copy lands before the shared-fence signal.
+     * Copies the cached Iris depth/motion-vector GL textures and the full-resolution scene
+     * snapshot into the D3D12 presentation's shared textures. Called from the D3D12 present
+     * path while recording the frame's GL work, so the copies land before the shared-fence
+     * signal.
      */
     public static void writeFrameInputs(D3D12PresentationContext presentationContext) {
         ITexture depth = cachedDepth;
         ITexture mv = cachedMotionVector;
-        ITexture hudless = cachedHudlessColor;
+        ITexture snapshot = cachedSceneSnapshot;
         if (depth != null) {
             InteropResourcesConverter.flipY(depth, presentationContext.depthGlTexture());
         }
         if (mv != null) {
             InteropResourcesConverter.flipMotionVectorY(mv, presentationContext.mvGlTexture());
         }
-        if (hudless != null) {
-            InteropResourcesConverter.flipY(hudless, presentationContext.hudlessGlTexture());
+        if (snapshot != null) {
+            InteropResourcesConverter.flipY(snapshot, presentationContext.hudlessGlTexture());
+        }
+    }
+
+    /**
+     * Snapshots the full-resolution pre-UI scene layer (the upscaled origin render target)
+     * into a dedicated GL texture. Called from GameRenderer.render right before GUI
+     * compositing (FogRenderer.endFrame), mirroring the Vulkan capture point, so XeSS-FG's
+     * HUDLESS_COLOR input is a genuine full-resolution HUD-less frame instead of the
+     * low-resolution pre-upscale dispatch color.
+     */
+    public static void captureSceneSnapshot() {
+        D3D12PresentationContext ctx = presentation;
+        if (ctx == null) {
+            return;
+        }
+        try {
+            IFrameBuffer origin = SuperResolutionAPI.getOriginMinecraftFrameBuffer();
+            ITexture source = origin == null
+                    ? null : origin.getTexture(FrameBufferAttachmentType.Color);
+            if (source == null || source.handle() == 0) {
+                return;
+            }
+            int width = ctx.width();
+            int height = ctx.height();
+            if (width <= 0 || height <= 0) {
+                return;
+            }
+            // Same-thread GL DSA copy; the snapshot texture mirrors the back-buffer extent
+            // (the flipY compute reads it at the presentation size). While the extents do
+            // not match (window resize), keep the previous snapshot instead of a partial copy.
+            if (source.getWidth() != width || source.getHeight() != height) {
+                return;
+            }
+            if (cachedSceneSnapshot == null
+                    || snapshotWidth != width || snapshotHeight != height) {
+                destroySceneSnapshot();
+                cachedSceneSnapshot = GlTexture2D.create(
+                        TextureDescription.create()
+                                .type(TextureType.Texture2D)
+                                .width(width)
+                                .height(height)
+                                .format(TextureFormat.RGBA8)
+                                .usages(TextureUsages.create().sampler())
+                                .label("SRD3D12SceneSnapshot")
+                                .build());
+                snapshotWidth = width;
+                snapshotHeight = height;
+            }
+            Gl.DSA.copyImageSubData(
+                    (int) source.handle(), GL41.GL_TEXTURE_2D, 0, 0, 0, 0,
+                    (int) cachedSceneSnapshot.handle(), GL41.GL_TEXTURE_2D, 0, 0, 0, 0,
+                    width, height, 1);
+        } catch (Throwable throwable) {
+            SuperResolution.LOGGER.warn("[D3D12] XeSS-FG scene snapshot failed", throwable);
+            destroySceneSnapshot();
+        }
+    }
+
+    private static void destroySceneSnapshot() {
+        if (cachedSceneSnapshot != null) {
+            try {
+                cachedSceneSnapshot.destroy();
+            } catch (Throwable throwable) {
+                SuperResolution.LOGGER.debug(
+                        "[D3D12] scene snapshot destroy failed", throwable);
+            }
+            cachedSceneSnapshot = null;
+            snapshotWidth = -1;
+            snapshotHeight = -1;
         }
     }
 
@@ -451,6 +548,8 @@ public final class D3D12FrameGeneration {
         cachedDepth = null;
         cachedMotionVector = null;
         cachedHudlessColor = null;
+        destroySceneSnapshot();
+        cachedJitterOffset = new Vector2f(0.0f, 0.0f);
         cachedFrameTimeDelta = 0.0f;
         lastCameraStateValid = false;
         uiCompositionApplied = false;

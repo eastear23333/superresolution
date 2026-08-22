@@ -19,8 +19,11 @@
 package io.homo.superresolution.common.mixin.presentation.v1_21_1;
 
 #if MC_VER >= MC_1_21 && MC_VER < MC_1_21_2
+import io.homo.superresolution.common.framegeneration.D3D12FrameGeneration;
 import io.homo.superresolution.common.presentation.PresentationFeature;
 import io.homo.superresolution.common.presentation.capture.FrameCaptureManager;
+import io.homo.superresolution.common.presentation.d3d12.D3D12PresentationFeature;
+import io.homo.superresolution.common.presentation.vulkan.VulkanPresentationFeature;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;
@@ -43,8 +46,12 @@ public abstract class VulkanPresentationGameRendererCaptureMixin {
             boolean advanceGameTime,
             CallbackInfo ci
     ) {
-        if (PresentationFeature.isPresentationRequested()) {
+        if (VulkanPresentationFeature.isRequested()) {
             FrameCaptureManager.captureHudlessColor();
+        } else if (D3D12PresentationFeature.isRequested()) {
+            // Full-resolution pre-UI scene snapshot for XeSS-FG's HUDLESS_COLOR input
+            // (the Vulkan capture ring is not usable under D3D12 presentation).
+            D3D12FrameGeneration.captureSceneSnapshot();
         }
     }
 
