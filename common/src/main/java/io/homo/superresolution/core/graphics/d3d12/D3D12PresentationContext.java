@@ -118,6 +118,16 @@ public final class D3D12PresentationContext implements AutoCloseable {
     private long nextGlFence = 1;
     private long lastD3d12Signal;
     private volatile boolean vsync = true;
+    /**
+     * Whether the DXGI factory supports DXGI_FEATURE_PRESENT_ALLOW_TEARING (Windows 10
+     * 1703+). A windowed flip-model Present with SyncInterval 0 is still throttled to the
+     * monitor refresh rate by DWM unless the swap chain was created with
+     * DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING and Present passes DXGI_PRESENT_ALLOW_TEARING —
+     * without it "vsync off" locks the game to the refresh rate, while the Vulkan
+     * presentation runs uncapped (VK_PRESENT_MODE_IMMEDIATE_KHR). The XeSS-FG developer
+     * guide prescribes the same: Present(0, DXGI_PRESENT_ALLOW_TEARING).
+     */
+    private static volatile boolean allowTearingSupported;
 
     private D3D12PresentationContext(
             Arena arena, long hwnd, MemorySegment device, MemorySegment queue, MemorySegment swapchain,
@@ -182,6 +192,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
                     0, windows.win32.graphics.dxgi.IDXGIFactory6.iid(), ppFactory));
             windows.win32.graphics.dxgi.IDXGIFactory6 factory =
                     windows.win32.graphics.dxgi.IDXGIFactory6.wrap(ppFactory.get(ADDRESS, 0));
+            allowTearingSupported = queryAllowTearing(factory);
 
             MemorySegment adapter = findAdapter(factory, arena, adapterLuid);
             if (adapter.address() == 0) {
@@ -466,6 +477,34 @@ public final class D3D12PresentationContext implements AutoCloseable {
             throw new IllegalStateException(
                     "D3D12/DXGI call failed with HRESULT 0x" + Integer.toHexString(hr));
         }
+    }
+
+    /**
+     * Queries DXGI_FEATURE_PRESENT_ALLOW_TEARING on the factory. A failure or an
+     * unsupported answer merely keeps the uncapped-present path disabled (vsync off then
+     * falls back to the refresh-locked SyncInterval 0 behavior); it never fails setup.
+     */
+    private static boolean queryAllowTearing(windows.win32.graphics.dxgi.IDXGIFactory6 factory) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment supported = temp.allocate(JAVA_INT);
+            int hr = factory.CheckFeatureSupport(
+                    windows.win32.graphics.dxgi.DXGI_FEATURE.PRESENT_ALLOW_TEARING,
+                    supported, (int) JAVA_INT.byteSize());
+            boolean result = hr >= 0 && supported.get(JAVA_INT, 0) != 0;
+            io.homo.superresolution.common.SuperResolution.LOGGER.info(
+                    "[D3D12] DXGI_FEATURE_PRESENT_ALLOW_TEARING={}", result);
+            return result;
+        } catch (Throwable throwable) {
+            io.homo.superresolution.common.SuperResolution.LOGGER.debug(
+                    "[D3D12] CheckFeatureSupport(ALLOW_TEARING) failed", throwable);
+            return false;
+        }
+    }
+
+    /** The flags the swap chain was created with; ResizeBuffers must pass the same value. */
+    private static int swapchainFlags() {
+        return allowTearingSupported
+                ? windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_FLAG.ALLOW_TEARING : 0;
     }
 
     private static long queryOpenGlAdapterLuid() {
@@ -851,22 +890,29 @@ public final class D3D12PresentationContext implements AutoCloseable {
     /**
      * Presents through the current swap chain. When XeSS-FG took over, the proxy nulls its
      * Present vtable slot after the first Present, so a cached function pointer captured on
-     * takeover is used instead of re-reading the vtable each frame.
+     * takeover is used instead of re-reading the vtable each frame. The proxy receives the
+     * same SyncInterval/Flags as the plain swap chain (with vsync off and tearing support
+     * this is the Present(0, DXGI_PRESENT_ALLOW_TEARING) the XeSS-FG guide prescribes).
      */
     private static int presentSwapchain(MemorySegment swapchain, boolean vsync) {
         if (swapchain == null || swapchain.address() == 0L) {
             // Defensive: never walk the vtbl of a released swap chain (AV at 0x0).
             return 0;
         }
+        int syncInterval = vsync ? 1 : 0;
+        // DXGI_PRESENT_ALLOW_TEARING is only legal with SyncInterval 0 on a swap chain
+        // created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.
+        int presentFlags = !vsync && allowTearingSupported
+                ? windows.win32.graphics.dxgi.DXGI_PRESENT.ALLOW_TEARING : 0;
         long fn = cachedXefgPresentFn;
         if (fn == 0L) {
             // No XeSS-FG takeover yet: present through the plain vtable like before.
             return windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain)
-                    .Present(vsync ? 1 : 0, 0);
+                    .Present(syncInterval, presentFlags);
         }
         try {
             return (int) PRESENT_DOWN.invokeExact(
-                    MemorySegment.ofAddress(fn), swapchain, (int) (vsync ? 1 : 0), (int) 0);
+                    MemorySegment.ofAddress(fn), swapchain, syncInterval, presentFlags);
         } catch (Throwable throwable) {
             throw new RuntimeException("D3D12 present via cached XeSS-FG slot failed", throwable);
         }
@@ -888,7 +934,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
         windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC1.BufferCount(scDesc, 3);
         windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC1.SwapEffect(
                 scDesc, windows.win32.graphics.dxgi.DXGI_SWAP_EFFECT.FLIP_SEQUENTIAL);
-        windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC1.Flags(scDesc, 0);
+        windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC1.Flags(scDesc, swapchainFlags());
         return scDesc;
     }
 
@@ -918,7 +964,8 @@ public final class D3D12PresentationContext implements AutoCloseable {
                 waitForGpu();
             }
             lastHr = swapchainIface.ResizeBuffers1(3, newWidth, newHeight,
-                    windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM, 0,
+                    windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM,
+                    swapchainFlags(),
                     MemorySegment.NULL, MemorySegment.NULL);
             if (lastHr >= 0) {
                 break;
@@ -969,6 +1016,9 @@ public final class D3D12PresentationContext implements AutoCloseable {
         windows.win32.graphics.dxgi.IDXGIFactory6 factory =
                 windows.win32.graphics.dxgi.IDXGIFactory6.wrap(ppFactory.get(ADDRESS, 0));
         this.factory = ppFactory.get(ADDRESS, 0);
+        // The flags written into the new desc must match what Present/ResizeBuffers will
+        // use, so re-query tearing support for the new factory before building the desc.
+        allowTearingSupported = queryAllowTearing(factory);
         MemorySegment scDesc = buildSwapchainDesc(arena, newWidth, newHeight);
         MemorySegment ppNew = arena.allocate(ADDRESS);
         checkHr(factory.CreateSwapChainForHwnd(
