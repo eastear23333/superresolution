@@ -118,9 +118,20 @@ public final class D3D12FrameGeneration {
     private static float cachedFovDegrees = -1f;
     /** Last multiplier pushed to the provider; re-synced from the config each present. */
     private static int appliedInterpolatedFrames = -1;
-    /** Presentation extent last pushed to the provider's tagged resource size. */
-    private static int reportedWidth = -1;
-    private static int reportedHeight = -1;
+    /**
+     * Extent of the shared depth/motion-vector textures the current frame's inputs were
+     * flipped into: the dispatch textures' native size on the low-res path, or the
+     * presentation extent on the fallback path (dispatch depth/MV sizes disagree).
+     * Zero until the first frame with inputs decides it.
+     */
+    private static int inputExtentWidth;
+    private static int inputExtentHeight;
+    /** Frame-input extent last pushed to the provider's tagged resource size. */
+    private static int reportedInputWidth;
+    private static int reportedInputHeight;
+    /** HUD-less extent last pushed to the provider (always the presentation extent). */
+    private static int reportedHudlessWidth = -1;
+    private static int reportedHudlessHeight = -1;
     /** Camera discontinuity detection inputs for resetHistory (position/dimension/fov). */
     private static Vector3d lastCameraPosition;
     private static float lastCameraFov = Float.NEGATIVE_INFINITY;
@@ -249,8 +260,10 @@ public final class D3D12FrameGeneration {
             provider = d3d12Provider;
             // Force the next beforePresent to re-sync the multiplier and tagged extent.
             appliedInterpolatedFrames = -1;
-            reportedWidth = -1;
-            reportedHeight = -1;
+            reportedInputWidth = 0;
+            reportedInputHeight = 0;
+            reportedHudlessWidth = -1;
+            reportedHudlessHeight = -1;
             lastCameraStateValid = false;
             uiCompositionApplied = false;
             // Keep enabled=false: XeSS-FG starts disabled and is only enabled once a frame
@@ -365,10 +378,20 @@ public final class D3D12FrameGeneration {
                     "[D3D12] XeSS-FG interpolated frames per present: {}", interpolatedFrames);
             active.setNumInterpolatedFrames(interpolatedFrames);
         }
-        if (presentation.width() != reportedWidth || presentation.height() != reportedHeight) {
-            reportedWidth = presentation.width();
-            reportedHeight = presentation.height();
-            active.updateResourceExtent(reportedWidth, reportedHeight);
+        // The frame-input extent was decided in writeFrameInputs (the dispatch textures'
+        // native size, or the presentation extent on the fallback path); the HUD-less
+        // extent always tracks the presentation (back buffer) extent per the SDK guide.
+        if (inputExtentWidth != reportedInputWidth || inputExtentHeight != reportedInputHeight) {
+            reportedInputWidth = inputExtentWidth;
+            reportedInputHeight = inputExtentHeight;
+            if (reportedInputWidth > 0 && reportedInputHeight > 0) {
+                active.updateFrameInputExtent(reportedInputWidth, reportedInputHeight);
+            }
+        }
+        if (presentation.width() != reportedHudlessWidth || presentation.height() != reportedHudlessHeight) {
+            reportedHudlessWidth = presentation.width();
+            reportedHudlessHeight = presentation.height();
+            active.updateHudlessExtent(reportedHudlessWidth, reportedHudlessHeight);
         }
     }
 
@@ -399,20 +422,64 @@ public final class D3D12FrameGeneration {
      * snapshot into the D3D12 presentation's shared textures. Called from the D3D12 present
      * path while recording the frame's GL work, so the copies land before the shared-fence
      * signal.
+     *
+     * <p>The depth/motion-vector shared textures are (re)created at the inputs' native
+     * dispatch resolution and the SDK tags them at that extent: XeSS-FG then treats them
+     * as low-res motion vectors (documented default) and upsamples/dilates internally.
+     * Only when the two dispatch textures disagree on size does the fallback tag the
+     * presentation extent, matching the old full-resolution blit behavior.</p>
      */
     public static void writeFrameInputs(D3D12PresentationContext presentationContext) {
         ITexture depth = cachedDepth;
         ITexture mv = cachedMotionVector;
         ITexture snapshot = cachedSceneSnapshot;
-        if (depth != null) {
+        boolean inputsWanted = frameGenerationInputsWanted();
+        if (inputsWanted && depth != null && mv != null) {
+            int depthWidth = depth.getWidth();
+            int depthHeight = depth.getHeight();
+            int mvWidth = mv.getWidth();
+            int mvHeight = mv.getHeight();
+            // One extent for both inputs (SDK constraint). A dispatch size larger than
+            // the presentation (supersampling) also takes the fallback: XeSS-FG expects
+            // motion vectors at or below the target resolution.
+            boolean nativeLowRes = depthWidth == mvWidth && depthHeight == mvHeight
+                    && depthWidth > 0 && depthHeight > 0
+                    && depthWidth <= presentationContext.width()
+                    && depthHeight <= presentationContext.height();
+            int targetWidth = nativeLowRes ? depthWidth : presentationContext.width();
+            int targetHeight = nativeLowRes ? depthHeight : presentationContext.height();
+            if (targetWidth != inputExtentWidth || targetHeight != inputExtentHeight) {
+                SuperResolution.LOGGER.info(
+                        "[D3D12] XeSS-FG frame inputs: depth={}x{} mv={}x{} -> {} extent {}x{}",
+                        depthWidth, depthHeight, mvWidth, mvHeight,
+                        nativeLowRes ? "native low-res" : "fallback",
+                        targetWidth, targetHeight);
+            }
+            presentationContext.ensureFrameInputResources(targetWidth, targetHeight);
+            inputExtentWidth = targetWidth;
+            inputExtentHeight = targetHeight;
             InteropResourcesConverter.flipY(depth, presentationContext.depthGlTexture());
-        }
-        if (mv != null) {
             InteropResourcesConverter.flipMotionVectorY(mv, presentationContext.mvGlTexture());
         }
-        if (snapshot != null) {
+        if (inputsWanted && snapshot != null) {
             InteropResourcesConverter.flipY(snapshot, presentationContext.hudlessGlTexture());
         }
+    }
+
+    /**
+     * Whether this frame should copy frame-generation inputs into the shared D3D12
+     * textures at all. Skips the per-frame copies when XeSS-FG cannot tag this frame
+     * anyway (mode disabled, presentation down, or takeover impossible) — previously the
+     * flips ran unconditionally and burned GPU time with frame generation off or in menus.
+     */
+    private static boolean frameGenerationInputsWanted() {
+        if (!FrameGeneration.displayedMode().isEnabled() || presentation == null) {
+            return false;
+        }
+        // Armed but not yet taken over: initialize() may succeed in this frame's
+        // beforePresent, which tags immediately — the inputs must already be in place.
+        return provider != null || (pendingInit
+                && XESS_FG_GROUP_ID.equals(SuperResolutionConfig.getFrameGenerationProvider()));
     }
 
     /**
@@ -423,6 +490,12 @@ public final class D3D12FrameGeneration {
      * low-resolution pre-upscale dispatch color.
      */
     public static void captureSceneSnapshot() {
+        // A full-resolution copyImageSubData every frame; skip entirely when XeSS-FG
+        // cannot consume it (mode disabled or presentation down). Deferred takeovers
+        // (pendingInit) still snapshot so the first tagged frame has a HUD-less color.
+        if (presentation == null || !FrameGeneration.displayedMode().isEnabled()) {
+            return;
+        }
         D3D12PresentationContext ctx = presentation;
         if (ctx == null) {
             return;
@@ -541,8 +614,12 @@ public final class D3D12FrameGeneration {
             provider = null;
             enabled = false;
             appliedInterpolatedFrames = -1;
-            reportedWidth = -1;
-            reportedHeight = -1;
+            inputExtentWidth = 0;
+            inputExtentHeight = 0;
+            reportedInputWidth = 0;
+            reportedInputHeight = 0;
+            reportedHudlessWidth = -1;
+            reportedHudlessHeight = -1;
         }
         presentation = null;
         cachedDepth = null;

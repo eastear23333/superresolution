@@ -64,11 +64,22 @@ public interface D3D12FrameGenerationProvider extends FrameGenerationProvider {
     }
 
     /**
-     * Updates the extent reported when tagging depth/motion-vector resources; called after
-     * the presentation (re)establishes its size so the tagged resource size never goes
-     * stale across a resize.
+     * Updates the extent reported when tagging the depth/motion-vector resources. This is
+     * the frame inputs' native (dispatch) resolution, which is lower than the presentation
+     * extent when upscaling — XeSS-FG treats a resourceSize smaller than the back buffer
+     * (without the HIGH_RES_MV flag) as low-res motion vectors and upsamples/dilates them
+     * internally, which is the documented default and recommended configuration. Depth and
+     * motion vectors must share this extent.
      */
-    default void updateResourceExtent(int width, int height) {
+    default void updateFrameInputExtent(int width, int height) {
+    }
+
+    /**
+     * Updates the extent reported when tagging the HUD-less color resource. The XeSS-FG
+     * guide requires the HUD-less extent to match the back buffer, so this always tracks
+     * the presentation extent, independent of the frame-input extent.
+     */
+    default void updateHudlessExtent(int width, int height) {
     }
 
     /** Enable or disable interpolation. */

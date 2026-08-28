@@ -104,6 +104,13 @@ public final class D3D12PresentationContext implements AutoCloseable {
     private MemorySegment mvTexture;
     private long mvAllocationSize;
     private GlD3D12ImportableTexture2D mvGlTexture;
+    /**
+     * Size of the shared depth/motion-vector textures. These follow the frame inputs'
+     * native dispatch resolution (low-res MV path), not the presentation extent; the
+     * tagged resourceSize tells XeSS-FG to upsample/dilate them internally.
+     */
+    private int frameInputWidth;
+    private int frameInputHeight;
     /** R8G8B8A8 HUD-less color for XeSS-FG UI composition, written from GL. */
     private MemorySegment hudlessTexture;
     private long hudlessAllocationSize;
@@ -301,7 +308,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
                             textureDescription(width, height, TextureFormat.RGBA8, "D3D12PresentationHudless"),
                             SRSurfaceFormat.R8G8B8A8_UNORM));
 
-            return new D3D12PresentationContext(
+            D3D12PresentationContext presentationContext = new D3D12PresentationContext(
                     arena, hwnd, devicePtr, queuePtr, swapchainPtr, ppFactory.get(ADDRESS, 0),
                     allocators, listPtr, fencePtr,
                     captureTexture, allocationSize, captureGlTexture,
@@ -309,6 +316,11 @@ public final class D3D12PresentationContext implements AutoCloseable {
                     mvTexture, mvSize, mvGlTexture,
                     hudlessTexture, hudlessSize, hudlessGlTexture,
                     semaphore, width, height);
+            // Placeholder size until the first dispatch decides the real frame-input
+            // extent (ensureFrameInputResources rebuilds when it differs).
+            presentationContext.frameInputWidth = width;
+            presentationContext.frameInputHeight = height;
+            return presentationContext;
         } catch (Throwable throwable) {
             arena.close();
             throw throwable;
@@ -1052,38 +1064,6 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.captureAllocationSize = newSize;
         this.captureGlTexture = newCaptureGlTexture;
 
-        MemorySegment depthDesc = fillResourceDesc(
-                arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R32_FLOAT);
-        MemorySegment newDepthTexture = createCaptureTexture(arena, deviceIface, depthDesc);
-        long depthHandle = createSharedHandle(arena, deviceIface, newDepthTexture);
-        long depthSize = queryAllocationSize(arena, deviceIface, depthDesc);
-        GlD3D12ImportableTexture2D newDepthGlTexture = new GlD3D12ImportableTexture2D(
-                new D3D12InteropContext.Resource(0, 0, depthHandle, depthSize,
-                        textureDescription(newWidth, newHeight, TextureFormat.R32F, "D3D12PresentationDepth"),
-                        SRSurfaceFormat.R32_FLOAT));
-        if (depthGlTexture != null) {
-            depthGlTexture.destroy();
-        }
-        this.depthTexture = newDepthTexture;
-        this.depthAllocationSize = depthSize;
-        this.depthGlTexture = newDepthGlTexture;
-
-        MemorySegment mvDesc = fillResourceDesc(
-                arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R16G16_FLOAT);
-        MemorySegment newMvTexture = createCaptureTexture(arena, deviceIface, mvDesc);
-        long mvHandle = createSharedHandle(arena, deviceIface, newMvTexture);
-        long mvSize = queryAllocationSize(arena, deviceIface, mvDesc);
-        GlD3D12ImportableTexture2D newMvGlTexture = new GlD3D12ImportableTexture2D(
-                new D3D12InteropContext.Resource(0, 0, mvHandle, mvSize,
-                        textureDescription(newWidth, newHeight, TextureFormat.RG16F, "D3D12PresentationMotionVector"),
-                        SRSurfaceFormat.R16G16_FLOAT));
-        if (mvGlTexture != null) {
-            mvGlTexture.destroy();
-        }
-        this.mvTexture = newMvTexture;
-        this.mvAllocationSize = mvSize;
-        this.mvGlTexture = newMvGlTexture;
-
         MemorySegment hudlessDesc = fillResourceDesc(
                 arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM);
         MemorySegment newHudlessTexture = createCaptureTexture(arena, deviceIface, hudlessDesc);
@@ -1099,6 +1079,84 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.hudlessTexture = newHudlessTexture;
         this.hudlessAllocationSize = hudlessSize;
         this.hudlessGlTexture = newHudlessGlTexture;
+
+        // The depth/motion-vector textures no longer follow the presentation extent: they
+        // are managed by ensureFrameInputResources at the frame inputs' native dispatch
+        // resolution and survive a window resize until the next dispatch says otherwise.
+    }
+
+    /**
+     * Rebuilds the shared depth/motion-vector textures at the frame inputs' native
+     * (dispatch) resolution. XeSS-FG receives them tagged at this extent as low-res
+     * motion vectors (the documented default) and upsamples/dilates internally — the
+     * previous behavior blitted them up to the presentation extent, which both cost a
+     * full-resolution copy per frame and fed the SDK pre-blurred velocities. The two
+     * inputs must share one extent (SDK constraint), so callers fall back to the
+     * presentation extent when the dispatch textures disagree.
+     */
+    public void ensureFrameInputResources(int newWidth, int newHeight) {
+        if (newWidth <= 0 || newHeight <= 0) {
+            return;
+        }
+        if (frameInputWidth == newWidth && frameInputHeight == newHeight
+                && depthTexture != null && mvTexture != null) {
+            return;
+        }
+        // The SDK interpolates from these textures on the presentation queue; wait for
+        // the last submitted frame before the old resources are destroyed. Size changes
+        // are rare (render-scale/pack switches), so the stall is acceptable.
+        waitForGpu();
+        recreateFrameInputResources(newWidth, newHeight);
+        io.homo.superresolution.common.SuperResolution.LOGGER.info(
+                "[D3D12] frame-input textures rebuilt at {}x{}", newWidth, newHeight);
+    }
+
+    private void recreateFrameInputResources(int newWidth, int newHeight) {
+        windows.win32.graphics.direct3d12.ID3D12Device deviceIface =
+                windows.win32.graphics.direct3d12.ID3D12Device.wrap(device);
+
+        MemorySegment depthDesc = fillResourceDesc(
+                arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R32_FLOAT);
+        MemorySegment newDepthTexture = createCaptureTexture(arena, deviceIface, depthDesc);
+        long depthHandle = createSharedHandle(arena, deviceIface, newDepthTexture);
+        long depthSize = queryAllocationSize(arena, deviceIface, depthDesc);
+        GlD3D12ImportableTexture2D newDepthGlTexture = new GlD3D12ImportableTexture2D(
+                new D3D12InteropContext.Resource(0, 0, depthHandle, depthSize,
+                        textureDescription(newWidth, newHeight, TextureFormat.R32F, "D3D12PresentationDepth"),
+                        SRSurfaceFormat.R32_FLOAT));
+
+        MemorySegment mvDesc = fillResourceDesc(
+                arena, newWidth, newHeight, windows.win32.graphics.dxgi.common.DXGI_FORMAT.R16G16_FLOAT);
+        MemorySegment newMvTexture = createCaptureTexture(arena, deviceIface, mvDesc);
+        long mvHandle = createSharedHandle(arena, deviceIface, newMvTexture);
+        long mvSize = queryAllocationSize(arena, deviceIface, mvDesc);
+        GlD3D12ImportableTexture2D newMvGlTexture = new GlD3D12ImportableTexture2D(
+                new D3D12InteropContext.Resource(0, 0, mvHandle, mvSize,
+                        textureDescription(newWidth, newHeight, TextureFormat.RG16F, "D3D12PresentationMotionVector"),
+                        SRSurfaceFormat.R16G16_FLOAT));
+
+        if (depthGlTexture != null) {
+            depthGlTexture.destroy();
+        }
+        if (mvGlTexture != null) {
+            mvGlTexture.destroy();
+        }
+        // The GL import dropped its reference; release this side's COM reference too
+        // (the resize path previously leaked the old committed resources).
+        if (depthTexture != null && depthTexture.address() != 0L) {
+            windows.win32.graphics.direct3d12.ID3D12Resource.wrap(depthTexture).Release();
+        }
+        if (mvTexture != null && mvTexture.address() != 0L) {
+            windows.win32.graphics.direct3d12.ID3D12Resource.wrap(mvTexture).Release();
+        }
+        this.depthTexture = newDepthTexture;
+        this.depthAllocationSize = depthSize;
+        this.depthGlTexture = newDepthGlTexture;
+        this.mvTexture = newMvTexture;
+        this.mvAllocationSize = mvSize;
+        this.mvGlTexture = newMvGlTexture;
+        this.frameInputWidth = newWidth;
+        this.frameInputHeight = newHeight;
     }
 
     private void waitForGpu() {
