@@ -205,8 +205,19 @@ public final class D3D12FrameGeneration {
             return;
         }
         // D3D12 activation flips which FG backends are supported; the registry caches
-        // requirement results, so drop the stale cache before consulting it.
+        // requirement results, so drop the stale cache before consulting it. Runs even
+        // when the mode is OFF: the UI capability query (FrameGeneration.isSupported)
+        // relies on the refreshed cache to enable the frame-generation multiplier options
+        // for XeSS-FG while the presentation is up.
         FrameGenerationRegistry.clearSupportCache();
+        // Frame-generation mode OFF: do not take over. The SDK proxy presents at ~1 fps
+        // in passthrough (enabled=false), so the plain swap chain stays until the mode
+        // flips on (beforePresent retries the deferred initialize each frame).
+        if (!FrameGeneration.displayedMode().isEnabled()) {
+            pendingInit = true;
+            SuperResolution.LOGGER.info("[D3D12] XeSS-FG deferred: frame generation mode is OFF");
+            return;
+        }
         String configured = SuperResolutionConfig.getFrameGenerationProvider();
         if (!XESS_FG_GROUP_ID.equals(configured)) {
             // Arm the deferred retry: selecting XeSS-FG mid-session must take over
@@ -298,16 +309,26 @@ public final class D3D12FrameGeneration {
      * No-op while depth/motion vectors are unavailable, so the proxy stays in passthrough.
      */
     public static void beforePresent() {
-        // If initialization was deferred (XeLL context not ready, or XeSS-FG selected
-        // mid-session), retry now that the low-latency renegotiation has run and the
-        // configured provider matches; the config check keeps the per-frame retry cheap.
+        // If initialization was deferred (XeLL context not ready, XeSS-FG selected
+        // mid-session, or the frame-generation mode was OFF), retry now that the
+        // low-latency renegotiation has run, the configured provider matches and the
+        // mode is on; the config checks keep the per-frame retry cheap.
         if (provider == null && pendingInit && presentation != null
                 && XESS_FG_GROUP_ID.equals(SuperResolutionConfig.getFrameGenerationProvider())
-                && XeLLowLatency.context().address() != 0L) {
+                && XeLLowLatency.context().address() != 0L
+                && FrameGeneration.displayedMode().isEnabled()) {
             initialize(presentation);
         }
         D3D12FrameGenerationProvider active = provider;
         if (active == null) {
+            return;
+        }
+        // Frame-generation mode switched off: release the takeover and restore the plain
+        // swap chain. The SDK proxy presents at ~1 fps in passthrough (enabled=false),
+        // so an off mode must not keep the proxy on the window; re-takeover re-arms from
+        // the deferred retry above when the mode flips back on.
+        if (!FrameGeneration.displayedMode().isEnabled()) {
+            releaseTakeover("frame generation mode OFF");
             return;
         }
         // Own per-present counter for the XeSS-FG frame id (see field docs).
@@ -478,8 +499,9 @@ public final class D3D12FrameGeneration {
         }
         // Armed but not yet taken over: initialize() may succeed in this frame's
         // beforePresent, which tags immediately — the inputs must already be in place.
-        return provider != null || (pendingInit
-                && XESS_FG_GROUP_ID.equals(SuperResolutionConfig.getFrameGenerationProvider()));
+        return FrameGeneration.displayedMode().isEnabled()
+                && (provider != null || (pendingInit
+                && XESS_FG_GROUP_ID.equals(SuperResolutionConfig.getFrameGenerationProvider())));
     }
 
     /**
@@ -555,6 +577,64 @@ public final class D3D12FrameGeneration {
             snapshotWidth = -1;
             snapshotHeight = -1;
         }
+    }
+
+    /**
+     * Releases an active XeSS-FG takeover mid-game and restores the plain presentation
+     * swap chain. Used when the frame-generation mode flips off: the SDK proxy presents
+     * at ~1 fps in passthrough (enabled=false), so an off mode must not keep the proxy
+     * on the window. The reverse of {@link #initialize}: destroy the provider first
+     * (after dropping the presentation's proxy reference, which the SDK refuses to
+     * destroy while aliased), then recreate the presentation swap chain. Re-takeover is
+     * re-armed by the per-frame deferred retry in {@link #beforePresent} when the mode
+     * flips back on.
+     */
+    /** Whether the XeSS-FG proxy currently owns the presentation swap chain. */
+    public static boolean isTakeoverActive() {
+        return provider != null;
+    }
+
+    public static void releaseTakeover(String reason) {
+        D3D12PresentationContext presentationContext = presentation;
+        if (provider == null || presentationContext == null) {
+            return;
+        }
+        try {
+            if (enabled) {
+                provider.setEnabled(false);
+            }
+            // Drop our reference to the proxy swap chain before destroying the context
+            // (see shutdown(): xefgSwapChainDestroy fails with -19 POINTER_STILL_IN_USE
+            // while any proxy reference is alive).
+            presentationContext.releaseSwapchain();
+            presentationContext.resetPresentSlot();
+            provider.shutdownD3D12();
+        } catch (Throwable throwable) {
+            SuperResolution.LOGGER.warn("[D3D12] XeSS-FG release failed", throwable);
+        }
+        provider = null;
+        enabled = false;
+        appliedInterpolatedFrames = -1;
+        inputExtentWidth = 0;
+        inputExtentHeight = 0;
+        reportedInputWidth = 0;
+        reportedInputHeight = 0;
+        reportedHudlessWidth = -1;
+        reportedHudlessHeight = -1;
+        try {
+            presentationContext.recreateSwapchain(
+                    presentationContext.width(), presentationContext.height());
+            SuperResolution.LOGGER.info("[D3D12] XeSS-FG released ({}); swap chain restored", reason);
+        } catch (Throwable throwable) {
+            SuperResolution.LOGGER.error(
+                    "[D3D12] XeSS-FG release swap chain restore failed", throwable);
+            D3D12PresentationFeature.disableAfterFailure(throwable);
+        }
+        // Re-arm the deferred retry: beforePresent re-attempts initialize() each frame
+        // while pendingInit is set, so flipping the mode back on re-takes the swap chain
+        // without a restart. Failing to arm this left the session stuck in "released"
+        // after the first OFF -> ON cycle.
+        pendingInit = true;
     }
 
     /** Enables or disables interpolation on the provider. */

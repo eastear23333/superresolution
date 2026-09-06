@@ -122,6 +122,16 @@ public final class D3D12PresentationFeature {
                     finalColor == null ? "null"
                             : "(" + finalColor.getWidth() + "," + finalColor.getHeight() + ")");
             try {
+                // While the XeSS-FG proxy owns the swap chain, ResizeBuffers hits the SDK's
+                // interposed implementation, which rejects parameters that do not match the
+                // proxy chain (observed 0x80070057 E_INVALIDARG under a tearless proxy chain),
+                // and recreating the chain also fails (0x80070005 E_ACCESSDENIED, the SDK
+                // still holds the window's flip chain). Release the takeover first so the
+                // native chain resizes, then let beforePresent re-take the swap chain at the
+                // new size on the next frame (releaseTakeover re-arms pendingInit).
+                if (D3D12FrameGeneration.isTakeoverActive()) {
+                    D3D12FrameGeneration.releaseTakeover("window resize");
+                }
                 presentationContext.resize(Math.max(w, 1), Math.max(h, 1));
             } catch (Throwable throwable) {
                 // Resize could not recover: the old swap chain is already released, so

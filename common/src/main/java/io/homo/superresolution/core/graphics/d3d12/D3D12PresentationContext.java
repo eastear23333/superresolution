@@ -902,10 +902,21 @@ public final class D3D12PresentationContext implements AutoCloseable {
     /**
      * Presents through the current swap chain. When XeSS-FG took over, the proxy nulls its
      * Present vtable slot after the first Present, so a cached function pointer captured on
-     * takeover is used instead of re-reading the vtable each frame. The proxy receives the
-     * same SyncInterval/Flags as the plain swap chain (with vsync off and tearing support
-     * this is the Present(0, DXGI_PRESENT_ALLOW_TEARING) the XeSS-FG guide prescribes).
+     * takeover is used instead of re-reading the vtable each frame.
+     *
+     * <p>While the proxy is active the tear flag is never passed to the Present: the
+     * proxy's chain can lack DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING even when the takeover
+     * description asked for it (the backend's runtime feature query can fail while the
+     * presentation's own query succeeded), and Present(0, ALLOW_TEARING) on such a chain
+     * not only fails itself — it also poisons the SDK's interpolated-frame presents,
+     * which then fail with DXGI_ERROR_INVALID_CALL on every frame and freeze the screen.
+     * The plain (non-proxy) chain keeps the tear flag when tearing is supported; a
+     * rejected tear flag there degrades to immediate Present once for the session.
      */
+    private static final int DXGI_ERROR_INVALID_CALL = 0x887A0001;
+
+    private static volatile boolean tearingDegraded;
+
     private static int presentSwapchain(MemorySegment swapchain, boolean vsync) {
         if (swapchain == null || swapchain.address() == 0L) {
             // Defensive: never walk the vtbl of a released swap chain (AV at 0x0).
@@ -913,9 +924,32 @@ public final class D3D12PresentationContext implements AutoCloseable {
         }
         int syncInterval = vsync ? 1 : 0;
         // DXGI_PRESENT_ALLOW_TEARING is only legal with SyncInterval 0 on a swap chain
-        // created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.
-        int presentFlags = !vsync && allowTearingSupported
-                ? windows.win32.graphics.dxgi.DXGI_PRESENT.ALLOW_TEARING : 0;
+        // created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING. The XeSS-FG proxy chain can
+        // end up without the flag even when the takeover description asked for it (the
+        // runtime feature query inside the backend may fail), and handing the tear flag
+        // to the proxy's Present poisons the SDK: it rejects the Present AND every
+        // interpolated-frame Present it issues afterwards fails with 0x887A0001, freezing
+        // the screen. While the proxy is active, never pass the tear flag — the proxy
+        // presents the interpolated frames itself and owns their pacing.
+        int presentFlags = 0;
+        if (cachedXefgPresentFn == 0L && !vsync && allowTearingSupported) {
+            presentFlags = windows.win32.graphics.dxgi.DXGI_PRESENT.ALLOW_TEARING;
+        }
+        int result = doPresent(swapchain, syncInterval, presentFlags);
+        if (result == DXGI_ERROR_INVALID_CALL && presentFlags != 0) {
+            if (!tearingDegraded) {
+                tearingDegraded = true;
+                io.homo.superresolution.common.SuperResolution.LOGGER.warn(
+                        "[D3D12] Present(0, ALLOW_TEARING) rejected by the swap chain"
+                                + " (0x887A0001, proxy chain without the tear flag);"
+                                + " degrading to plain immediate Present for this session");
+            }
+            result = doPresent(swapchain, syncInterval, 0);
+        }
+        return result;
+    }
+
+    private static int doPresent(MemorySegment swapchain, int syncInterval, int presentFlags) {
         long fn = cachedXefgPresentFn;
         if (fn == 0L) {
             // No XeSS-FG takeover yet: present through the plain vtable like before.
