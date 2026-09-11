@@ -844,6 +844,21 @@ public final class D3D12PresentationContext implements AutoCloseable {
         }
     }
 
+    /**
+     * Whether the D3D12 device is already removed (GetDeviceRemovedReason != S_OK). Used
+     * as a preflight before handing the window to the XeSS-FG SDK: initializing on a dead
+     * device guarantees the failure restore fails too (CreateSwapChainForHwnd returns
+     * DXGI_ERROR_DEVICE_REMOVED) and cascades into the frozen-window fallback.
+     */
+    public boolean isDeviceRemoved() {
+        try {
+            return windows.win32.graphics.direct3d12.ID3D12Device.wrap(device)
+                    .GetDeviceRemovedReason() != 0;
+        } catch (Throwable throwable) {
+            return false;
+        }
+    }
+
     private void throwDeviceRemoved() {
         int removalReason = windows.win32.graphics.direct3d12.ID3D12Device.wrap(device)
                 .GetDeviceRemovedReason();
@@ -996,25 +1011,33 @@ public final class D3D12PresentationContext implements AutoCloseable {
         waitForGpu();
         // ResizeBuffers re-creates the back buffers, so cached references must go first.
         releaseBackBuffers();
-        windows.win32.graphics.dxgi.IDXGISwapChain3 swapchainIface =
-                windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain);
         int lastHr = 0;
-        for (int retry = 0; retry < 8; retry++) {
-            if (retry > 0) {
-                try {
-                    Thread.sleep(32L * retry);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
+        if (swapchain == null || swapchain.address() == 0L) {
+            // The swap chain was already released (a XeSS-FG takeover release defers the
+            // restore to this resize so the chain is only built once, at the new size).
+            // Recreate it instead of resizing through a dangling NULL pointer — wrapping
+            // the NULL segment and calling ResizeBuffers1 dereferences address 0.
+            recreateSwapchain(newWidth, newHeight);
+        } else {
+            windows.win32.graphics.dxgi.IDXGISwapChain3 swapchainIface =
+                    windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain);
+            for (int retry = 0; retry < 8; retry++) {
+                if (retry > 0) {
+                    try {
+                        Thread.sleep(32L * retry);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    waitForGpu();
+                }
+                lastHr = swapchainIface.ResizeBuffers1(3, newWidth, newHeight,
+                        windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM,
+                        swapchainFlags(),
+                        MemorySegment.NULL, MemorySegment.NULL);
+                if (lastHr >= 0) {
                     break;
                 }
-                waitForGpu();
-            }
-            lastHr = swapchainIface.ResizeBuffers1(3, newWidth, newHeight,
-                    windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM,
-                    swapchainFlags(),
-                    MemorySegment.NULL, MemorySegment.NULL);
-            if (lastHr >= 0) {
-                break;
             }
         }
         if (lastHr < 0) {
@@ -1039,6 +1062,71 @@ public final class D3D12PresentationContext implements AutoCloseable {
         height = newHeight;
     }
 
+    /**
+     * Resizes the CURRENT swap chain in place — including the XeSS-FG proxy chain — and
+     * returns the final HRESULT ({@code >= 0} on success). The swap chain object itself
+     * is kept, so an active XeSS-FG takeover survives the resize.
+     *
+     * <p>The buffer count/format/flags come from {@code GetDesc} instead of our own
+     * preferred values: DXGI rejects a ResizeBuffers whose parameters do not match the
+     * chain's creation desc (E_INVALIDARG — observed when resizing the SDK's tearless
+     * proxy chain with our ALLOW_TEARING flag), and only the creation desc is guaranteed
+     * to be accepted. The XeSS-FG SDK is built for this: it interposes Present on the
+     * proxy and re-queries the back buffers, and the header exposes
+     * {@code UpdateExternalHeapOnResize} precisely because in-place resizes are
+     * supported.</p>
+     */
+    public int resizeSwapchainInPlace(int newWidth, int newHeight) {
+        if (swapchain == null || swapchain.address() == 0L) {
+            return 0x80004005; // E_FAIL: nothing to resize (caller falls back)
+        }
+        waitForGpu();
+        // ResizeBuffers re-creates the back buffers, so cached references must go first.
+        releaseBackBuffers();
+        int lastHr = 0;
+        int bufferCount = 3;
+        int format = windows.win32.graphics.dxgi.common.DXGI_FORMAT.R8G8B8A8_UNORM;
+        int flags = 0;
+        try (Arena frameArena = Arena.ofConfined()) {
+            MemorySegment desc = frameArena.allocate(
+                    windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC.layout());
+            checkHr(windows.win32.graphics.dxgi.IDXGISwapChain.wrap(swapchain).GetDesc(desc));
+            bufferCount = windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC.BufferCount(desc);
+            format = windows.win32.graphics.dxgi.common.DXGI_MODE_DESC.Format(
+                    windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC.BufferDesc(desc));
+            flags = windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC.Flags(desc);
+        } catch (Throwable throwable) {
+            // Desc query failed: fall through with our defaults and let ResizeBuffers
+            // verdict decide (the caller releases the takeover on failure).
+            io.homo.superresolution.common.SuperResolution.LOGGER.debug(
+                    "[D3D12] swapchain GetDesc failed during in-place resize", throwable);
+        }
+        windows.win32.graphics.dxgi.IDXGISwapChain3 swapchainIface =
+                windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain);
+        for (int retry = 0; retry < 8; retry++) {
+            if (retry > 0) {
+                try {
+                    Thread.sleep(32L * retry);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                waitForGpu();
+            }
+            lastHr = swapchainIface.ResizeBuffers1(bufferCount, newWidth, newHeight,
+                    format, flags, MemorySegment.NULL, MemorySegment.NULL);
+            if (lastHr >= 0) {
+                break;
+            }
+        }
+        if (lastHr >= 0) {
+            recreateCaptureResources(newWidth, newHeight);
+            width = newWidth;
+            height = newHeight;
+        }
+        return lastHr;
+    }
+
     /** Releases the swap chain so the XeSS-FG SDK can create its own on the window. */
     public void releaseSwapchain() {
         releaseBackBuffers();
@@ -1053,7 +1141,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
         // A window may only own one flip-model swap chain, so release the old one
         // before creating a replacement (otherwise CreateSwapChainForHwnd fails).
         releaseBackBuffers();
-        if (swapchain.address() != 0) {
+        if (swapchain != null && swapchain.address() != 0) {
             windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain).Release();
         }
         MemorySegment ppFactory = arena.allocate(ADDRESS);
@@ -1193,7 +1281,15 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.frameInputHeight = newHeight;
     }
 
-    private void waitForGpu() {
+    /**
+     * Blocks until the presentation queue has completed all submitted work (bounded by a
+     * 2s poll). Public because the XeSS-FG takeover must hand the window to the SDK only
+     * on an idle queue: re-running {@code xefgSwapChainD3D12InitFromSwapChainDesc} while
+     * our command queue still has in-flight work hangs the device (observed
+     * {@code DXGI_ERROR_DEVICE_HUNG 0x887a0006} right after a resize released the proxy
+     * and the next frame re-took the swap chain).
+     */
+    public void waitForGpu() {
         if (lastD3d12Signal <= 0) {
             return;
         }

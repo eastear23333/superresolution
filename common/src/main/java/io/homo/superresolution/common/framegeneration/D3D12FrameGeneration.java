@@ -119,6 +119,21 @@ public final class D3D12FrameGeneration {
     /** Last multiplier pushed to the provider; re-synced from the config each present. */
     private static int appliedInterpolatedFrames = -1;
     /**
+     * Session latch: XeSS-FG supports exactly ONE SDK context per process. Every attempt
+     * at a second {@code xefgSwapChainD3D12InitFromSwapChainDesc} after a release has
+     * killed the D3D12 device and frozen the GLFW_NO_API window (2026-09-06 19:48:53:
+     * "Failed to create command queue for asynchronous presentation" 0x8007000e then
+     * DEVICE_HUNG 0x887a0006; 20:43:23: xellSetAppQueue -1000 then device removed
+     * 0x887a0005 — libxell registers the app queue once per process, so the second init
+     * can never succeed). Set the moment a takeover is released or an init fails; the
+     * plain swap chain keeps presenting and only a game restart brings XeSS-FG back.
+     */
+    private static boolean takeoverBlocked;
+    /** Logged once: the user re-enabled frame generation while the takeover is latched. */
+    private static boolean blockedNoticeLogged;
+    /** Logged once: frame inputs are flowing but the mode is not enabled (diagnostic). */
+    private static boolean modeOffNoticeLogged;
+    /**
      * Extent of the shared depth/motion-vector textures the current frame's inputs were
      * flipped into: the dispatch textures' native size on the low-res path, or the
      * presentation extent on the fallback path (dispatch depth/MV sizes disagree).
@@ -190,6 +205,12 @@ public final class D3D12FrameGeneration {
      */
     public static synchronized void initialize(D3D12PresentationContext presentationContext) {
         presentation = presentationContext;
+        // Register the dispatch listener BEFORE any gate: the lazy takeover waits for the
+        // first depth/motion-vector frame, and those caches are only filled by this very
+        // listener — registering it later deadlocked the takeover (resizefix3, 2026-09-06
+        // 22:02: initialize returned early on the mode-OFF gate, listener never
+        // registered, cachedDepth stayed null forever, no takeover ever happened).
+        ensureEventRegistered();
         if (provider != null) {
             return;
         }
@@ -238,6 +259,19 @@ public final class D3D12FrameGeneration {
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG deferred: XeLL context not ready");
             return;
         }
+        // Lazy takeover: wait for the first frame that actually carries depth/motion
+        // vectors. Taking over on the title screen wastes the session's one SDK context
+        // on the inevitable maximize/resize the user performs before entering a world
+        // (2026-09-06 21:21:09: takeover on the title screen, 21:30:34 maximize → release
+        // → latch → XeSS-FG never ran). The first dispatch frame takes over and tags in
+        // the same present, so nothing is lost by waiting.
+        if (cachedDepth == null || cachedMotionVector == null) {
+            pendingInit = true;
+            SuperResolution.LOGGER.info(
+                    "[D3D12] XeSS-FG deferred: no depth/motion-vector frame yet "
+                            + "(take over on the first in-world frame)");
+            return;
+        }
         FrameGenerationDescription description = FrameGenerationRegistry.getDescriptionById(XEFG_BACKEND_ID);
         boolean supported = description != null && FrameGenerationRegistry.isSupported(description);
         if (!supported) {
@@ -253,6 +287,23 @@ public final class D3D12FrameGeneration {
         }
         pendingInit = false;
         ensureEventRegistered();
+        // Never hand a removed device to the SDK: the init attempt would fail anyway and
+        // the failure restore (CreateSwapChainForHwnd) fails too, cascading into the
+        // frozen-window fallback. Latch and stay on the plain swap chain instead.
+        if (presentation.isDeviceRemoved()) {
+            takeoverBlocked = true;
+            SuperResolution.LOGGER.error(
+                    "[D3D12] XeSS-FG skipped: D3D12 device is removed; takeover blocked this session");
+            return;
+        }
+        // Hand the window over only on an idle queue: initializing the SDK while our
+        // command queue still has work in flight hangs the device (0x887a0006
+        // DXGI_ERROR_DEVICE_HUNG right after a resize-driven release + re-takeover).
+        try {
+            presentation.waitForGpu();
+        } catch (Throwable throwable) {
+            SuperResolution.LOGGER.debug("[D3D12] wait for GPU idle before XeSS-FG init failed", throwable);
+        }
         // xefgSwapChainD3D12InitFromSwapChainDesc creates its own swap chain on the window,
         // which requires the presentation's swap chain to be released first.
         presentation.releaseSwapchain();
@@ -288,10 +339,14 @@ public final class D3D12FrameGeneration {
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG took over the swap chain (proxy={})",
                     Long.toHexString(proxy));
         } else {
+            // Latch the failure: this session already burned its one SDK context attempt
+            // (a retry removes the D3D12 device — see takeoverBlocked).
+            takeoverBlocked = true;
             // Restore the presentation swap chain so rendering keeps working.
             try {
                 presentation.recreateSwapchain(presentation.width(), presentation.height());
-                SuperResolution.LOGGER.info("[D3D12] XeSS-FG initialization failed; swap chain restored");
+                SuperResolution.LOGGER.info("[D3D12] XeSS-FG initialization failed; swap chain restored "
+                        + "(takeover blocked; restart the game to re-enable XeSS-FG)");
             } catch (Throwable restoreFailure) {
                 // The presentation swap chain is already released and cannot be recreated
                 // (e.g. the device died mid-initialization). A null swap chain would crash
@@ -309,11 +364,40 @@ public final class D3D12FrameGeneration {
      * No-op while depth/motion vectors are unavailable, so the proxy stays in passthrough.
      */
     public static void beforePresent() {
+        // Cheap idempotent safety net: the lazy takeover depends on this listener, and it
+        // must never depend on initialize() getting past its gates first.
+        ensureEventRegistered();
+        // Tell the user (once) why re-enabling frame generation does nothing after a
+        // release: the takeover is latched off for the rest of the session.
+        if (takeoverBlocked && provider == null && !blockedNoticeLogged
+                && FrameGeneration.displayedMode().isEnabled()) {
+            blockedNoticeLogged = true;
+            SuperResolution.LOGGER.warn(
+                    "[D3D12] XeSS-FG frame generation is on but the takeover is latched off this "
+                            + "session (one SDK context per process — a re-init removes the device); "
+                            + "restart the game to re-enable it");
+        }
+        // Diagnostic (once): inputs are flowing but the mode gate is still off — tells
+        // apart "no shader-compat dispatch" from "mode not supported" without a debugger.
+        if (provider == null && pendingInit && !takeoverBlocked && !modeOffNoticeLogged
+                && cachedDepth != null && cachedMotionVector != null
+                && !FrameGeneration.displayedMode().isEnabled()) {
+            modeOffNoticeLogged = true;
+            SuperResolution.LOGGER.info(
+                    "[D3D12] XeSS-FG inputs available but the frame generation mode is OFF "
+                            + "(supported={}, shaderEnvCompatible={}); takeover stays deferred",
+                    FrameGeneration.isSupported(),
+                    FrameGeneration.isShaderEnvironmentCompatible());
+        }
         // If initialization was deferred (XeLL context not ready, XeSS-FG selected
         // mid-session, or the frame-generation mode was OFF), retry now that the
         // low-latency renegotiation has run, the configured provider matches and the
-        // mode is on; the config checks keep the per-frame retry cheap.
-        if (provider == null && pendingInit && presentation != null
+        // mode is on; the config checks keep the per-frame retry cheap. A latched
+        // takeover (released once, or a failed init) never retries: the second
+        // in-process SDK init always kills the D3D12 device.
+        if (provider == null && pendingInit && !takeoverBlocked
+                && presentation != null
+                && cachedDepth != null && cachedMotionVector != null
                 && XESS_FG_GROUP_ID.equals(SuperResolutionConfig.getFrameGenerationProvider())
                 && XeLLowLatency.context().address() != 0L
                 && FrameGeneration.displayedMode().isEnabled()) {
@@ -325,10 +409,11 @@ public final class D3D12FrameGeneration {
         }
         // Frame-generation mode switched off: release the takeover and restore the plain
         // swap chain. The SDK proxy presents at ~1 fps in passthrough (enabled=false),
-        // so an off mode must not keep the proxy on the window; re-takeover re-arms from
-        // the deferred retry above when the mode flips back on.
+        // so an off mode must not keep the proxy on the window. NOTE: the released
+        // takeover does NOT come back this session (see takeoverBlocked) — only a game
+        // restart re-enables XeSS-FG.
         if (!FrameGeneration.displayedMode().isEnabled()) {
-            releaseTakeover("frame generation mode OFF");
+            releaseTakeover("frame generation mode OFF", true);
             return;
         }
         // Own per-present counter for the XeSS-FG frame id (see field docs).
@@ -497,6 +582,11 @@ public final class D3D12FrameGeneration {
         if (!FrameGeneration.displayedMode().isEnabled() || presentation == null) {
             return false;
         }
+        // Takeover latched off after a failure: no provider is coming this session, so the
+        // per-frame depth/motion-vector copies would only burn GPU time.
+        if (provider == null && takeoverBlocked) {
+            return false;
+        }
         // Armed but not yet taken over: initialize() may succeed in this frame's
         // beforePresent, which tags immediately — the inputs must already be in place.
         return FrameGeneration.displayedMode().isEnabled()
@@ -516,6 +606,11 @@ public final class D3D12FrameGeneration {
         // cannot consume it (mode disabled or presentation down). Deferred takeovers
         // (pendingInit) still snapshot so the first tagged frame has a HUD-less color.
         if (presentation == null || !FrameGeneration.displayedMode().isEnabled()) {
+            return;
+        }
+        // No takeover this session (latched after a failed init): skip the full-resolution
+        // copy entirely.
+        if (provider == null && takeoverBlocked) {
             return;
         }
         D3D12PresentationContext ctx = presentation;
@@ -581,24 +676,78 @@ public final class D3D12FrameGeneration {
 
     /**
      * Releases an active XeSS-FG takeover mid-game and restores the plain presentation
-     * swap chain. Used when the frame-generation mode flips off: the SDK proxy presents
-     * at ~1 fps in passthrough (enabled=false), so an off mode must not keep the proxy
-     * on the window. The reverse of {@link #initialize}: destroy the provider first
-     * (after dropping the presentation's proxy reference, which the SDK refuses to
-     * destroy while aliased), then recreate the presentation swap chain. Re-takeover is
-     * re-armed by the per-frame deferred retry in {@link #beforePresent} when the mode
-     * flips back on.
+     * swap chain. Used when the frame-generation mode flips off or on a window resize:
+     * the SDK proxy presents at ~1 fps in passthrough (enabled=false), so an off mode
+     * must not keep the proxy on the window. The reverse of {@link #initialize}: destroy
+     * the provider first (after dropping the presentation's proxy reference, which the
+     * SDK refuses to destroy while aliased), then recreate the presentation swap chain.
+     *
+     * <p>The released takeover does NOT come back this session: XeSS-FG supports one SDK
+     * context per process, and every re-init attempt after a release has killed the
+     * D3D12 device (see {@link #takeoverBlocked}). Only a game restart re-enables it.</p>
      */
     /** Whether the XeSS-FG proxy currently owns the presentation swap chain. */
     public static boolean isTakeoverActive() {
         return provider != null;
     }
 
+    /**
+     * Called on a frame whose window size differs from the presentation's while the
+     * XeSS-FG proxy owns the swap chain. Resizes the proxy chain IN PLACE (with the
+     * chain's own creation parameters — see
+     * {@link D3D12PresentationContext#resizeSwapchainInPlace}) so the session's one SDK
+     * context survives the resize and interpolation keeps running.
+     *
+     * @return true when the proxy was resized in place and the presentation must NOT run
+     *         its own swap-chain resize; false when the takeover was released (the
+     *         presentation then resizes/recreates its plain swap chain, which also
+     *         handles the released NULL swap chain).
+     */
+    public static boolean notifyWindowResize(int newWidth, int newHeight) {
+        D3D12PresentationContext presentationContext = presentation;
+        if (provider == null || presentationContext == null) {
+            return false;
+        }
+        try {
+            int hr = presentationContext.resizeSwapchainInPlace(newWidth, newHeight);
+            if (hr >= 0) {
+                SuperResolution.LOGGER.info(
+                        "[D3D12] XeSS-FG proxy swap chain resized in place to {}x{}; takeover kept",
+                        newWidth, newHeight);
+                return true;
+            }
+            SuperResolution.LOGGER.warn(
+                    "[D3D12] XeSS-FG proxy swap chain resize failed 0x{}; releasing takeover "
+                            + "(XeSS-FG stays off until the game restarts)",
+                    Integer.toHexString(hr));
+        } catch (Throwable throwable) {
+            SuperResolution.LOGGER.warn(
+                    "[D3D12] XeSS-FG proxy swap chain resize failed; releasing takeover "
+                            + "(XeSS-FG stays off until the game restarts)", throwable);
+        }
+        releaseTakeover("window resize", false);
+        return false;
+    }
+
     public static void releaseTakeover(String reason) {
+        releaseTakeover(reason, true);
+    }
+
+    /**
+     * @param restoreSwapchain false when the caller recreates/resizes the swap chain right
+     *                         after (a window resize): restoring first would build a chain
+     *                         at the stale size and throw it away one frame later.
+     */
+    public static void releaseTakeover(String reason, boolean restoreSwapchain) {
         D3D12PresentationContext presentationContext = presentation;
         if (provider == null || presentationContext == null) {
             return;
         }
+        // Latch BEFORE anything else: this session has used its one XeSS-FG context. A
+        // re-init (resize, mode toggle, anything) removes the D3D12 device and freezes
+        // the window — verified twice on 2026-09-06 (19:48:53 queue creation 0x8007000e
+        // -> DEVICE_HUNG; 20:43:23 xellSetAppQueue -1000 -> device removed 0x887a0005).
+        takeoverBlocked = true;
         try {
             if (enabled) {
                 provider.setEnabled(false);
@@ -621,20 +770,25 @@ public final class D3D12FrameGeneration {
         reportedInputHeight = 0;
         reportedHudlessWidth = -1;
         reportedHudlessHeight = -1;
-        try {
-            presentationContext.recreateSwapchain(
-                    presentationContext.width(), presentationContext.height());
-            SuperResolution.LOGGER.info("[D3D12] XeSS-FG released ({}); swap chain restored", reason);
-        } catch (Throwable throwable) {
-            SuperResolution.LOGGER.error(
-                    "[D3D12] XeSS-FG release swap chain restore failed", throwable);
-            D3D12PresentationFeature.disableAfterFailure(throwable);
+        if (restoreSwapchain) {
+            try {
+                presentationContext.recreateSwapchain(
+                        presentationContext.width(), presentationContext.height());
+                SuperResolution.LOGGER.info("[D3D12] XeSS-FG released ({}); swap chain restored", reason);
+            } catch (Throwable throwable) {
+                SuperResolution.LOGGER.error(
+                        "[D3D12] XeSS-FG release swap chain restore failed", throwable);
+                D3D12PresentationFeature.disableAfterFailure(throwable);
+                return;
+            }
+        } else {
+            SuperResolution.LOGGER.info(
+                    "[D3D12] XeSS-FG released ({}); swap chain restore deferred to the caller; "
+                            + "XeSS-FG stays off until the game restarts", reason);
         }
-        // Re-arm the deferred retry: beforePresent re-attempts initialize() each frame
-        // while pendingInit is set, so flipping the mode back on re-takes the swap chain
-        // without a restart. Failing to arm this left the session stuck in "released"
-        // after the first OFF -> ON cycle.
-        pendingInit = true;
+        // pendingInit stays cleared: the plain swap chain is the final state for this
+        // session (one SDK context per process — see takeoverBlocked).
+        pendingInit = false;
     }
 
     /** Enables or disables interpolation on the provider. */
@@ -702,6 +856,10 @@ public final class D3D12FrameGeneration {
             reportedHudlessHeight = -1;
         }
         presentation = null;
+        // A fresh D3D12 presentation (presentation-mode switch back to D3D12) starts with
+        // a clean takeover slate.
+        takeoverBlocked = false;
+        blockedNoticeLogged = false;
         cachedDepth = null;
         cachedMotionVector = null;
         cachedHudlessColor = null;
@@ -739,6 +897,7 @@ public final class D3D12FrameGeneration {
             // takeover (XeLL cannot re-create in-process, see the class note above).
             presentation = presentationContext;
             pendingInit = false;
+            takeoverBlocked = true;
             SuperResolution.LOGGER.info(
                     "[D3D12] XeSS-FG torn down before XeLL shutdown; swap chain restored "
                             + "(XeSS-FG stays off until restart)");

@@ -172,7 +172,11 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
 
     @Override
     public void setMarker(LowLatencyMarker marker) {
-        if (context == null || context.address() == 0L) {
+        // isAlive() guards the teardown race: disableAfterFailure can destroy the XeLL
+        // context between frames while the present path still calls setMarker — the
+        // context segment then exists (address != 0) but its memory session is closed,
+        // and touching it throws "Already closed".
+        if (context == null || context.address() == 0L || !context.scope().isAlive()) {
             return;
         }
         int xellMarker;
@@ -200,7 +204,7 @@ public final class XeLLowLatencyProvider implements LowLatencyProvider {
 
     @Override
     public void sleep() {
-        if (context == null || context.address() == 0L) {
+        if (context == null || context.address() == 0L || !context.scope().isAlive()) {
             return;
         }
         try {

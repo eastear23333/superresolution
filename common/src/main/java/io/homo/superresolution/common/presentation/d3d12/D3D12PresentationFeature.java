@@ -122,17 +122,22 @@ public final class D3D12PresentationFeature {
                     finalColor == null ? "null"
                             : "(" + finalColor.getWidth() + "," + finalColor.getHeight() + ")");
             try {
-                // While the XeSS-FG proxy owns the swap chain, ResizeBuffers hits the SDK's
-                // interposed implementation, which rejects parameters that do not match the
-                // proxy chain (observed 0x80070057 E_INVALIDARG under a tearless proxy chain),
-                // and recreating the chain also fails (0x80070005 E_ACCESSDENIED, the SDK
-                // still holds the window's flip chain). Release the takeover first so the
-                // native chain resizes, then let beforePresent re-take the swap chain at the
-                // new size on the next frame (releaseTakeover re-arms pendingInit).
+                // Resize order of preference:
+                // 1. The XeSS-FG proxy owns the chain → resize it IN PLACE with its own
+                //    creation parameters, so the session's one SDK context survives and
+                //    interpolation keeps running (a release + second init removes the
+                //    D3D12 device: xellSetAppQueue is one-shot per process).
+                // 2. Otherwise (or if the in-place resize fails and the takeover was
+                //    released) resize/recreate our plain swap chain — resize() also
+                //    handles the NULL swap chain left by the deferred restore.
+                boolean resizeHandled = false;
                 if (D3D12FrameGeneration.isTakeoverActive()) {
-                    D3D12FrameGeneration.releaseTakeover("window resize");
+                    resizeHandled = D3D12FrameGeneration.notifyWindowResize(
+                            Math.max(w, 1), Math.max(h, 1));
                 }
-                presentationContext.resize(Math.max(w, 1), Math.max(h, 1));
+                if (!resizeHandled) {
+                    presentationContext.resize(Math.max(w, 1), Math.max(h, 1));
+                }
             } catch (Throwable throwable) {
                 // Resize could not recover: the old swap chain is already released, so
                 // continuing to present would use-after-free. Disable D3D12 presentation
