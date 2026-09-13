@@ -110,6 +110,26 @@ public final class D3D12FrameGeneration {
      */
     private static float cachedFrameTimeDelta;
     /**
+     * Wall time the last Present spent inside the XeSS-FG proxy, in NANOSECONDS, reported by
+     * the D3D12 presentation. The proxy's Present does not return until the whole burst of
+     * generated frames has been delivered, so this is the part of the frame period that the
+     * frame generation itself created.
+     *
+     * <p>Why it matters: XeSS-FG drives its generated-frame spacing with
+     * {@code frameRenderTime} — "time that was required to render the current frame" — but
+     * {@link #cachedFrameTimeDelta} is the whole {@code runTick} CPU time, and the Present
+     * (hence the previous burst's blocking) is inside it. Handing that back makes the pacing
+     * self-referential: the burst is asked to fill a period that only exists because the
+     * burst was asked to fill it, so the real frame period settles at
+     * {@code renderTime * (count + 1)} instead of coming down towards the time the game
+     * actually spends rendering. Subtracting the block, which is what
+     * {@link #frameRenderTimeForProvider()} does, breaks that fixed point.
+     */
+    private static volatile long presentBlockNanos;
+    /** Start of the current pacing-report window, and the frames counted in it. */
+    private static long pacingReportWindowStart;
+    private static int pacingReportFrames;
+    /**
      * True vertical FOV (degrees) of the render projection, taken from the dispatch event
      * (Iris gbufferProjection, m11-derived) so the rebuilt XeSS-FG projection matches the
      * actual depth/motion-vector rendering instead of the vanilla-only fallback FOV.
@@ -118,6 +138,14 @@ public final class D3D12FrameGeneration {
     private static float cachedFovDegrees = -1f;
     /** Last multiplier pushed to the provider; re-synced from the config each present. */
     private static int appliedInterpolatedFrames = -1;
+    /**
+     * Records how long the last Present spent inside the XeSS-FG proxy (nanoseconds).
+     * Called by the D3D12 presentation right after the swap chain Present returns, whether
+     * or not a takeover is active; the consumer only uses it while interpolation is on.
+     */
+    public static void notePresentBlockNanos(long nanos) {
+        presentBlockNanos = nanos > 0L ? nanos : 0L;
+    }
     /**
      * Session latch: XeSS-FG supports exactly ONE SDK context per process. Every attempt
      * at a second {@code xefgSwapChainD3D12InitFromSwapChainDesc} after a release has
@@ -328,6 +356,10 @@ public final class D3D12FrameGeneration {
             reportedHudlessHeight = -1;
             lastCameraStateValid = false;
             uiCompositionApplied = false;
+            // A fresh proxy starts with no measured burst block and no report window.
+            presentBlockNanos = 0L;
+            pacingReportWindowStart = 0L;
+            pacingReportFrames = 0;
             // Keep enabled=false: XeSS-FG starts disabled and is only enabled once a frame
             // actually provides depth/motion vectors (beforePresent). Marking it enabled
             // here made the first input-less frame think interpolation was on and call
@@ -447,7 +479,7 @@ public final class D3D12FrameGeneration {
                 active.prepareD3D12Present(
                         xefgFrameId, viewMatrix(), projectionMatrix(),
                         cachedJitterOffset.x, cachedJitterOffset.y, 1.0f, 1.0f,
-                        cameraDiscontinuity(), frameRenderTimeMs(cachedFrameTimeDelta),
+                        cameraDiscontinuity(), frameRenderTimeForProvider(),
                         presentation.depthTexture().address(),
                         presentation.mvTexture().address(),
                         hudlessAvailable ? presentation.hudlessTexture().address() : 0L);
@@ -866,6 +898,9 @@ public final class D3D12FrameGeneration {
         destroySceneSnapshot();
         cachedJitterOffset = new Vector2f(0.0f, 0.0f);
         cachedFrameTimeDelta = 0.0f;
+        presentBlockNanos = 0L;
+        pacingReportWindowStart = 0L;
+        pacingReportFrames = 0;
         lastCameraStateValid = false;
         uiCompositionApplied = false;
     }
@@ -935,13 +970,63 @@ public final class D3D12FrameGeneration {
     }
 
     /**
-     * Converts the cached dispatch frame-time delta (nanoseconds) to the milliseconds that
-     * XeSS-FG's frameRenderTime constant expects. Non-positive deltas (first frame, or no
-     * completed "Frame" sample yet) tag as 0 ms so the SDK treats the frame as the stream
-     * start rather than an absurdly long interval.
+     * The {@code frameRenderTime} handed to XeSS-FG, in milliseconds: the measured frame
+     * period with the previous burst's own blocking taken back out.
+     *
+     * <p>The cached dispatch delta (nanoseconds, from {@code PerformanceTracker}'s "Frame"
+     * section, which wraps the Present) is the frame period as the game experiences it. What
+     * the provider wants is the time that went into <em>rendering</em> the frame, so the part
+     * the generated-frame delivery spent blocking is subtracted here — see
+     * {@link #presentBlockNanos} for why feeding the raw period back is self-referential.
+     *
+     * <p>Non-positive deltas (first frame, or no completed "Frame" sample yet) tag as 0 ms so
+     * the SDK treats the frame as the stream start rather than an absurdly long interval. For
+     * a frame that does have a period the value is never allowed to reach 0: under-reporting
+     * would ask for a burst shorter than the frames can be produced in, which is the
+     * dangerous direction — an unusable estimate falls back to the unmodified period instead.
      */
-    private static float frameRenderTimeMs(float frameTimeDeltaNanos) {
-        return frameTimeDeltaNanos > 0f ? frameTimeDeltaNanos / 1_000_000.0f : 0f;
+    private static float frameRenderTimeForProvider() {
+        float periodMs = cachedFrameTimeDelta > 0f ? cachedFrameTimeDelta / 1_000_000.0f : 0f;
+        long blockNanos = presentBlockNanos;
+        if (periodMs <= 0f || blockNanos <= 0L || !enabled || appliedInterpolatedFrames <= 1) {
+            return periodMs;
+        }
+        float renderMs = periodMs - blockNanos / 1_000_000.0f;
+        if (renderMs <= 0f) {
+            // The burst consumed the whole period: no usable estimate this frame. Keep the
+            // period rather than reporting 0, which the provider would read as a degenerate
+            // render time instead of "unknown".
+            return periodMs;
+        }
+        reportPacing(periodMs, renderMs);
+        return renderMs;
+    }
+
+    /**
+     * Periodic INFO report of the pair that decides whether the feedback loop is actually
+     * broken: the real frame period against the value handed to the provider. A render
+     * estimate that stays close to the period means the period is being set by something
+     * else (the display, vsync, the GPU) and this estimate is not limiting anything.
+     */
+    private static void reportPacing(float periodMs, float renderMs) {
+        pacingReportFrames++;
+        long now = System.nanoTime();
+        if (pacingReportWindowStart == 0L) {
+            pacingReportWindowStart = now;
+            return;
+        }
+        if (now - pacingReportWindowStart < 5_000_000_000L) {
+            return;
+        }
+        SuperResolution.LOGGER.info(
+                "[D3D12] XeSS-FG pacing: real frame {} ms, burst block {} ms, render-est {} ms"
+                        + " ({} frames)",
+                String.format("%.2f", periodMs),
+                String.format("%.2f", presentBlockNanos / 1_000_000.0f),
+                String.format("%.2f", renderMs),
+                pacingReportFrames);
+        pacingReportWindowStart = now;
+        pacingReportFrames = 0;
     }
 
     /**

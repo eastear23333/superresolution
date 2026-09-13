@@ -709,7 +709,15 @@ public final class D3D12PresentationContext implements AutoCloseable {
                 io.homo.superresolution.common.SuperResolution.LOGGER.warn(
                         "[D3D12] present skipped: swap chain released mid-frame (XeSS-FG/XeLL teardown)");
             } else {
+                long presentStartNanos = System.nanoTime();
                 int presentResult = presentSwapchain(swapchain, vsync);
+                // Report how much of the frame went into this Present. While XeSS-FG owns
+                // the swap chain the proxy does not return until the whole burst of
+                // generated frames is out, so this is the blocking the frame generation
+                // itself added; the tagger subtracts it from the frame period it hands the
+                // provider as frameRenderTime, which keeps the pacing from being
+                // self-referential (see D3D12FrameGeneration#presentBlockNanos).
+                D3D12FrameGeneration.notePresentBlockNanos(System.nanoTime() - presentStartNanos);
                 if (presentResult != 0) {
                     io.homo.superresolution.common.SuperResolution.LOGGER.warn(
                             "[D3D12] present result=0x{}", Integer.toHexString(presentResult));
