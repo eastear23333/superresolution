@@ -64,6 +64,16 @@ public final class D3D12PresentationContext implements AutoCloseable {
             FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT);
     private static final MethodHandle PRESENT_DOWN = NATIVE_LINKER.downcallHandle(PRESENT_DESC);
     private static volatile long cachedXefgPresentFn;
+    /**
+     * DXGI_SWAP_CHAIN_FLAG_* bits of the swap chain currently bound to the presentation, as
+     * reported by GetDesc1/GetDesc, or -1 when the desc could not be queried. The tear flag
+     * is handed to Present only when the chain actually carries ALLOW_TEARING: passing it
+     * to a chain without the flag is rejected (0x887A0001) and poisons the XeSS-FG proxy's
+     * interpolated presents. Querying the chain itself (instead of trusting our own
+     * DXGI_FEATURE_PRESENT_ALLOW_TEARING probe) also covers the SDK's proxy chain, which is
+     * created from a desc we only influence.
+     */
+    private static volatile int activeSwapchainFlags = -1;
     /** kernel32 event waits used for the flipY fence instead of 1ms polling. */
     private static final MethodHandle CREATE_EVENT = NATIVE_LINKER.defaultLookup()
             .find("CreateEventW").map(sym -> NATIVE_LINKER.downcallHandle(
@@ -150,6 +160,9 @@ public final class D3D12PresentationContext implements AutoCloseable {
         this.device = device;
         this.queue = queue;
         this.swapchain = swapchain;
+        // Remember the chain's creation flags: they decide whether Present may tear (and
+        // therefore exceed the refresh rate) instead of being DWM-throttled.
+        activeSwapchainFlags = querySwapchainFlags(swapchain);
         this.factory = factory;
         this.commandAllocators = commandAllocators;
         this.commandList = commandList;
@@ -888,6 +901,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
     /** Clears the cached Present slot (e.g. when the XeSS-FG proxy is torn down). */
     public void resetPresentSlot() {
         cachedXefgPresentFn = 0L;
+        activeSwapchainFlags = -1;
     }
 
     /**
@@ -912,6 +926,13 @@ public final class D3D12PresentationContext implements AutoCloseable {
             io.homo.superresolution.common.SuperResolution.LOGGER.warn(
                     "[D3D12] capture Present slot failed", throwable);
         }
+        // Re-read the proxy chain's flags and report whether its presents may tear: this is
+        // the value that decides whether the XeSS-FG output stays pinned to the refresh
+        // rate (DWM-throttled) or can exceed it.
+        int flags = cacheSwapchainFlags(swapchain);
+        io.homo.superresolution.common.SuperResolution.LOGGER.info(
+                "[D3D12] XeSS-FG proxy swap chain flags={} (ALLOW_TEARING {})",
+                describeSwapchainFlags(flags), isTearable(flags) ? "set" : "not set");
     }
 
     /**
@@ -919,14 +940,20 @@ public final class D3D12PresentationContext implements AutoCloseable {
      * Present vtable slot after the first Present, so a cached function pointer captured on
      * takeover is used instead of re-reading the vtable each frame.
      *
-     * <p>While the proxy is active the tear flag is never passed to the Present: the
-     * proxy's chain can lack DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING even when the takeover
-     * description asked for it (the backend's runtime feature query can fail while the
-     * presentation's own query succeeded), and Present(0, ALLOW_TEARING) on such a chain
-     * not only fails itself — it also poisons the SDK's interpolated-frame presents,
-     * which then fail with DXGI_ERROR_INVALID_CALL on every frame and freeze the screen.
-     * The plain (non-proxy) chain keeps the tear flag when tearing is supported; a
-     * rejected tear flag there degrades to immediate Present once for the session.
+     * <p>The tear flag is passed to the Present whenever the chain being presented
+     * actually carries DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING ({@link #tearingAllowed()},
+     * which reads the chain's own desc). Without the flag a windowed flip-model Present
+     * stays throttled to the monitor refresh rate by DWM even at SyncInterval 0, which is
+     * what kept the XeSS-FG output pinned to the panel rate; with it the output may exceed
+     * the refresh rate and tear (the player can cap the native rate in the game's own
+     * settings to control that). The flag is still never sent blindly: the SDK's proxy
+     * chain can lack the flag even when the takeover description asked for it (the
+     * backend's runtime feature query can fail while the presentation's own query
+     * succeeded), and Present(0, ALLOW_TEARING) on such a chain not only fails itself — it
+     * also poisons the SDK's interpolated-frame presents, which then fail with
+     * DXGI_ERROR_INVALID_CALL on every frame and freeze the screen. So: desc says tearable
+     * → tear; desc unreadable → fall back to the plain-chain-only rule; rejected anyway →
+     * latch the tear flag off for this chain and present immediately for the session.
      */
     private static final int DXGI_ERROR_INVALID_CALL = 0x887A0001;
 
@@ -939,15 +966,10 @@ public final class D3D12PresentationContext implements AutoCloseable {
         }
         int syncInterval = vsync ? 1 : 0;
         // DXGI_PRESENT_ALLOW_TEARING is only legal with SyncInterval 0 on a swap chain
-        // created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING. The XeSS-FG proxy chain can
-        // end up without the flag even when the takeover description asked for it (the
-        // runtime feature query inside the backend may fail), and handing the tear flag
-        // to the proxy's Present poisons the SDK: it rejects the Present AND every
-        // interpolated-frame Present it issues afterwards fails with 0x887A0001, freezing
-        // the screen. While the proxy is active, never pass the tear flag — the proxy
-        // presents the interpolated frames itself and owns their pacing.
+        // created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, so the decision is made from the
+        // bound chain's own creation flags rather than from a feature probe.
         int presentFlags = 0;
-        if (cachedXefgPresentFn == 0L && !vsync && allowTearingSupported) {
+        if (!vsync && tearingAllowed()) {
             presentFlags = windows.win32.graphics.dxgi.DXGI_PRESENT.ALLOW_TEARING;
         }
         int result = doPresent(swapchain, syncInterval, presentFlags);
@@ -956,12 +978,89 @@ public final class D3D12PresentationContext implements AutoCloseable {
                 tearingDegraded = true;
                 io.homo.superresolution.common.SuperResolution.LOGGER.warn(
                         "[D3D12] Present(0, ALLOW_TEARING) rejected by the swap chain"
-                                + " (0x887A0001, proxy chain without the tear flag);"
+                                + " (0x887A0001, chain without the tear flag);"
                                 + " degrading to plain immediate Present for this session");
             }
+            // Never hand the tear flag to this chain again: a rejected tear flag also
+            // poisons the SDK's interpolated presents (0x887A0001 on every frame).
+            activeSwapchainFlags = 0;
             result = doPresent(swapchain, syncInterval, 0);
         }
         return result;
+    }
+
+    /**
+     * Whether the currently bound swap chain may be presented with
+     * {@code DXGI_PRESENT_ALLOW_TEARING}. Decided by the chain's own desc flags, which is
+     * the only reliable source once the XeSS-FG proxy owns the chain. When the desc could
+     * not be read the previous conservative rule applies: tear on the plain chain only,
+     * never on the proxy.
+     */
+    private static boolean tearingAllowed() {
+        int flags = activeSwapchainFlags;
+        if (flags >= 0) {
+            return (flags & windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_FLAG.ALLOW_TEARING) != 0;
+        }
+        return allowTearingSupported && cachedXefgPresentFn == 0L;
+    }
+
+    /** True when {@code flags} (a DXGI_SWAP_CHAIN_FLAG_* mask) carries ALLOW_TEARING. */
+    private static boolean isTearable(int flags) {
+        return flags >= 0
+                && (flags & windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_FLAG.ALLOW_TEARING) != 0;
+    }
+
+    /** Human-readable flags value for logs ("unknown" when the desc query failed). */
+    private static String describeSwapchainFlags(int flags) {
+        return flags < 0 ? "unknown" : "0x" + Integer.toHexString(flags);
+    }
+
+    /**
+     * Re-reads the flags of {@code chain} and makes them the presentation's active set,
+     * returning the new value (-1 when no desc could be obtained). Called wherever the
+     * bound swap chain changes, so {@link #tearingAllowed()} always reflects the chain the
+     * next Present will hit.
+     */
+    private static int cacheSwapchainFlags(MemorySegment chain) {
+        int flags = querySwapchainFlags(chain);
+        activeSwapchainFlags = flags;
+        return flags;
+    }
+
+    /**
+     * Reads the creation flags of the given swap chain: GetDesc1 first, then the v0 GetDesc
+     * (same Flags field) as a fallback. Returns -1 when neither answers — the SDK's proxy
+     * interposes the DXGI swap chain but still services these queries.
+     */
+    private static int querySwapchainFlags(MemorySegment chain) {
+        if (chain == null || chain.address() == 0L) {
+            return -1;
+        }
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment desc1 = temp.allocate(
+                    windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC1.layout());
+            int hr = windows.win32.graphics.dxgi.IDXGISwapChain1.wrap(chain).GetDesc1(desc1);
+            if (hr >= 0) {
+                return windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC1.Flags(desc1);
+            }
+            io.homo.superresolution.common.SuperResolution.LOGGER.debug(
+                    "[D3D12] swapchain GetDesc1 failed: 0x{}", Integer.toHexString(hr));
+        } catch (Throwable throwable) {
+            io.homo.superresolution.common.SuperResolution.LOGGER.debug(
+                    "[D3D12] swapchain GetDesc1 failed", throwable);
+        }
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment desc = temp.allocate(
+                    windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC.layout());
+            int hr = windows.win32.graphics.dxgi.IDXGISwapChain.wrap(chain).GetDesc(desc);
+            if (hr >= 0) {
+                return windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC.Flags(desc);
+            }
+        } catch (Throwable throwable) {
+            io.homo.superresolution.common.SuperResolution.LOGGER.debug(
+                    "[D3D12] swapchain GetDesc failed", throwable);
+        }
+        return -1;
     }
 
     private static int doPresent(MemorySegment swapchain, int syncInterval, int presentFlags) {
@@ -1095,6 +1194,9 @@ public final class D3D12PresentationContext implements AutoCloseable {
             format = windows.win32.graphics.dxgi.common.DXGI_MODE_DESC.Format(
                     windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC.BufferDesc(desc));
             flags = windows.win32.graphics.dxgi.DXGI_SWAP_CHAIN_DESC.Flags(desc);
+            // Keep the tear decision in sync with the chain we just inspected (the desc is
+            // the same one ResizeBuffers is fed below, so this costs nothing extra).
+            activeSwapchainFlags = flags;
         } catch (Throwable throwable) {
             // Desc query failed: fall through with our defaults and let ResizeBuffers
             // verdict decide (the caller releases the takeover on failure).
@@ -1134,6 +1236,7 @@ public final class D3D12PresentationContext implements AutoCloseable {
             windows.win32.graphics.dxgi.IDXGISwapChain3.wrap(swapchain).Release();
             swapchain = MemorySegment.NULL;
         }
+        activeSwapchainFlags = -1;
     }
 
     /** Recreates the swap chain (used to restore it if XeSS-FG initialization fails). */
@@ -1159,8 +1262,10 @@ public final class D3D12PresentationContext implements AutoCloseable {
                 queue, MemorySegment.ofAddress(hwnd), scDesc, MemorySegment.NULL,
                 MemorySegment.NULL, ppNew));
         this.swapchain = ppNew.get(ADDRESS, 0);
+        int newFlags = cacheSwapchainFlags(this.swapchain);
         io.homo.superresolution.common.SuperResolution.LOGGER.info(
-                "[D3D12] swapchain recreated to {}x{}", newWidth, newHeight);
+                "[D3D12] swapchain recreated to {}x{} (flags={}, tearable={})", newWidth, newHeight,
+                describeSwapchainFlags(newFlags), isTearable(newFlags));
     }
 
     private void recreateCaptureResources(int newWidth, int newHeight) {
@@ -1347,6 +1452,12 @@ public final class D3D12PresentationContext implements AutoCloseable {
     public void setSwapchain(MemorySegment swapchain) {
         releaseBackBuffers();
         this.swapchain = swapchain;
+        // The proxy chain's desc (not our own feature probe) decides whether its presents
+        // can tear; refresh it here so presentSwapchain sees the right answer immediately.
+        int flags = cacheSwapchainFlags(swapchain);
+        io.homo.superresolution.common.SuperResolution.LOGGER.info(
+                "[D3D12] swap chain adopted (flags={}, tearable={})",
+                describeSwapchainFlags(flags), isTearable(flags));
     }
 
     /** The D3D12 depth resource (R32_FLOAT), tagged to XeSS-FG each present. */
