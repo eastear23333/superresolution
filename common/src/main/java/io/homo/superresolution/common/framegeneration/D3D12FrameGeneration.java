@@ -130,6 +130,20 @@ public final class D3D12FrameGeneration {
     private static long pacingReportWindowStart;
     private static int pacingReportFrames;
     /**
+     * Present-rate counters split by whether interpolation is on. These exist to settle
+     * the "the proxy presents at ~1 fps in passthrough" claim that once made the frame
+     * generation toggle irreversible (see {@link #beforePresent()}).
+     */
+    private static long presentRateWindowStart;
+    private static int presentRateWindowFrames;
+    private static boolean presentRateWindowInterpolating;
+    private static int passthroughSlowWindows;
+    /** Length of a present-rate measurement window, and the passthrough health check. */
+    private static final long PRESENT_RATE_WINDOW_NANOS = 5_000_000_000L;
+    /** Below this many presents per second a passthrough span counts as broken. */
+    private static final double PASSTHROUGH_MIN_RATE = 10.0;
+    private static final int PASSTHROUGH_MAX_SLOW_WINDOWS = 2;
+    /**
      * True vertical FOV (degrees) of the render projection, taken from the dispatch event
      * (Iris gbufferProjection, m11-derived) so the rebuilt XeSS-FG projection matches the
      * actual depth/motion-vector rendering instead of the vanilla-only fallback FOV.
@@ -259,9 +273,10 @@ public final class D3D12FrameGeneration {
         // relies on the refreshed cache to enable the frame-generation multiplier options
         // for XeSS-FG while the presentation is up.
         FrameGenerationRegistry.clearSupportCache();
-        // Frame-generation mode OFF: do not take over. The SDK proxy presents at ~1 fps
-        // in passthrough (enabled=false), so the plain swap chain stays until the mode
-        // flips on (beforePresent retries the deferred initialize each frame).
+        // Frame-generation mode OFF: do not take over yet. Nothing needs the proxy before
+        // the mode flips on, and beforePresent re-checks each frame (pendingInit) so the
+        // takeover happens the moment it does. NOTE: an already-established takeover is
+        // NOT dropped here — it just goes to passthrough, see beforePresent().
         if (!FrameGeneration.displayedMode().isEnabled()) {
             pendingInit = true;
             SuperResolution.LOGGER.info("[D3D12] XeSS-FG deferred: frame generation mode is OFF");
@@ -360,6 +375,10 @@ public final class D3D12FrameGeneration {
             presentBlockNanos = 0L;
             pacingReportWindowStart = 0L;
             pacingReportFrames = 0;
+            presentRateWindowStart = 0L;
+            presentRateWindowFrames = 0;
+            presentRateWindowInterpolating = false;
+            passthroughSlowWindows = 0;
             // Keep enabled=false: XeSS-FG starts disabled and is only enabled once a frame
             // actually provides depth/motion vectors (beforePresent). Marking it enabled
             // here made the first input-less frame think interpolation was on and call
@@ -439,15 +458,15 @@ public final class D3D12FrameGeneration {
         if (active == null) {
             return;
         }
-        // Frame-generation mode switched off: release the takeover and restore the plain
-        // swap chain. The SDK proxy presents at ~1 fps in passthrough (enabled=false),
-        // so an off mode must not keep the proxy on the window. NOTE: the released
-        // takeover does NOT come back this session (see takeoverBlocked) — only a game
-        // restart re-enables XeSS-FG.
-        if (!FrameGeneration.displayedMode().isEnabled()) {
-            releaseTakeover("frame generation mode OFF", true);
-            return;
-        }
+        // Frame-generation mode switched off: keep the takeover and let the proxy fall
+        // back to passthrough below (enabled=false). Releasing here used to be the whole
+        // reason the toggle was a one-way trip: XeSS-FG allows one SDK context per
+        // process, so destroying it locked frame generation off until a restart. The
+        // early integrations ran the proxy in passthrough and presented through it
+        // normally — see the note on teardownForLowLatencyShutdown(). reportPresentRate()
+        // measures the passthrough rate and passthroughWatchdog() releases the takeover
+        // if that claim turns out to hold on current drivers.
+        reportPresentRate(FrameGeneration.displayedMode().isEnabled());
         // Own per-present counter for the XeSS-FG frame id (see field docs).
         int xefgFrameId = (int) (xefgPresentCounter++ & 0xFFFFFFFFL);
         try {
@@ -708,11 +727,16 @@ public final class D3D12FrameGeneration {
 
     /**
      * Releases an active XeSS-FG takeover mid-game and restores the plain presentation
-     * swap chain. Used when the frame-generation mode flips off or on a window resize:
-     * the SDK proxy presents at ~1 fps in passthrough (enabled=false), so an off mode
-     * must not keep the proxy on the window. The reverse of {@link #initialize}: destroy
-     * the provider first (after dropping the presentation's proxy reference, which the
-     * SDK refuses to destroy while aliased), then recreate the presentation swap chain.
+     * swap chain. Reached only when the proxy can no longer be kept: a window resize it
+     * cannot follow, XeLL being torn down underneath it, or
+     * {@link #passthroughWatchdog(double)} measuring that passthrough really is as slow
+     * as it once was. Turning the frame-generation multiplier off deliberately does NOT
+     * come here anymore — that just switches the proxy to passthrough, keeping the one
+     * SDK context this process gets (see {@link #beforePresent()}).
+     *
+     * <p>The reverse of {@link #initialize}: destroy the provider first (after dropping
+     * the presentation's proxy reference, which the SDK refuses to destroy while
+     * aliased), then recreate the presentation swap chain.</p>
      *
      * <p>The released takeover does NOT come back this session: XeSS-FG supports one SDK
      * context per process, and every re-init attempt after a release has killed the
@@ -901,6 +925,10 @@ public final class D3D12FrameGeneration {
         presentBlockNanos = 0L;
         pacingReportWindowStart = 0L;
         pacingReportFrames = 0;
+        presentRateWindowStart = 0L;
+        presentRateWindowFrames = 0;
+        presentRateWindowInterpolating = false;
+        passthroughSlowWindows = 0;
         lastCameraStateValid = false;
         uiCompositionApplied = false;
     }
@@ -1027,6 +1055,80 @@ public final class D3D12FrameGeneration {
                 pacingReportFrames);
         pacingReportWindowStart = now;
         pacingReportFrames = 0;
+    }
+
+    /**
+     * Periodic INFO of how fast the swap chain actually presents, kept apart for the
+     * interpolating and passthrough spans. This is the measurement that decides whether
+     * keeping the takeover while frame generation is off is viable at all: a healthy
+     * passthrough span shows the normal refresh-bound rate, not ~1/s.
+     */
+    private static void reportPresentRate(boolean interpolating) {
+        long now = System.nanoTime();
+        if (presentRateWindowStart == 0L) {
+            presentRateWindowStart = now;
+            presentRateWindowFrames = 0;
+            presentRateWindowInterpolating = interpolating;
+            return;
+        }
+        if (presentRateWindowInterpolating != interpolating) {
+            // Never mix modes inside one window: close the span that just ended.
+            flushPresentRate(now, presentRateWindowInterpolating);
+            presentRateWindowStart = now;
+            presentRateWindowFrames = 0;
+            presentRateWindowInterpolating = interpolating;
+            return;
+        }
+        presentRateWindowFrames++;
+        if (now - presentRateWindowStart >= PRESENT_RATE_WINDOW_NANOS) {
+            flushPresentRate(now, interpolating);
+            presentRateWindowStart = now;
+            presentRateWindowFrames = 0;
+        }
+    }
+
+    private static void flushPresentRate(long now, boolean interpolating) {
+        double seconds = (now - presentRateWindowStart) / 1_000_000_000.0;
+        int frames = presentRateWindowFrames;
+        if (seconds < 1.0 || frames <= 0) {
+            return;
+        }
+        double rate = frames / seconds;
+        SuperResolution.LOGGER.info(
+                "[D3D12] present rate ({}): {} presents in {} s -> {}/s",
+                interpolating ? "interpolating" : "passthrough",
+                frames,
+                String.format("%.2f", seconds),
+                String.format("%.2f", rate));
+        if (!interpolating) {
+            passthroughWatchdog(rate);
+        } else {
+            passthroughSlowWindows = 0;
+        }
+    }
+
+    /**
+     * Safety net for the case where the old "passthrough is ~1 fps" observation still
+     * holds: rather than leaving the window at a slide-show pace, fall back to the
+     * previous behaviour (release the takeover and latch it off) after a couple of
+     * consecutive windows confirm the slowdown. Without this the player would be stuck
+     * with an unplayable frame rate and no clue why.
+     */
+    private static void passthroughWatchdog(double rate) {
+        if (rate >= PASSTHROUGH_MIN_RATE) {
+            passthroughSlowWindows = 0;
+            return;
+        }
+        passthroughSlowWindows++;
+        SuperResolution.LOGGER.warn(
+                "[D3D12] XeSS-FG passthrough presented at only {}/s ({} slow window(s)); "
+                        + "releasing the takeover after {} to restore the plain swap chain",
+                String.format("%.2f", rate), passthroughSlowWindows,
+                PASSTHROUGH_MAX_SLOW_WINDOWS);
+        if (passthroughSlowWindows >= PASSTHROUGH_MAX_SLOW_WINDOWS) {
+            passthroughSlowWindows = 0;
+            releaseTakeover("passthrough too slow", true);
+        }
     }
 
     /**
