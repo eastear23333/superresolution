@@ -33,7 +33,12 @@ public interface GuiEventListener {
     default void mouseDrag(float mouseX, float mouseY, float dragX, float dragY, int button) {
     }
 
-    default void mouseScroll(float x, float y, double scrollX) {
+    /**
+     * @return true when the widget handled the scroll and it should not propagate
+     *         (e.g. a scrollable page must not scroll while a slider is adjusted).
+     */
+    default boolean mouseScroll(float x, float y, double scrollX) {
+        return false;
     }
 
     default void keyPress(int keyCode, int scancode, int modifiers) {

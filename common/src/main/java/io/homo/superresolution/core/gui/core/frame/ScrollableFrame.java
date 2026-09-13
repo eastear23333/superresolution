@@ -252,15 +252,20 @@ public class ScrollableFrame extends Frame {
     }
 
     @Override
-    public void dispatchMouseScroll(float x, float y, double scrollAmount) {
+    public boolean dispatchMouseScroll(float x, float y, double scrollAmount) {
+        // Offer the scroll to whatever sits under the cursor first: controls such as
+        // sliders adjust themselves with the wheel and must not drag the page along.
+        Vector2f contentPos = screenToContent(x, y);
+        if (super.dispatchMouseScroll(contentPos.x, contentPos.y, scrollAmount)) {
+            return true;
+        }
+
         if (scrollHandler != null) {
             float deltaX = 0;
             float deltaY = enableVerticalScroll ? (float) scrollAmount : 0;
             scrollHandler.onScroll(deltaX, deltaY);
         }
-
-        Vector2f contentPos = screenToContent(x, y);
-        super.dispatchMouseScroll(contentPos.x, contentPos.y, scrollAmount);
+        return false;
     }
 
     @Override

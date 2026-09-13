@@ -143,7 +143,7 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
     private MaterialNavigationDrawer drawer;
     private List<Destroyable> destroyables = new ArrayList<>();
     private Map<String, List<QualityPresetOption>> qualityPresetOptionsCache;
-    private SelectionListOptionEntry<FrameGenerationMode> frameGenerationEntry;
+    private EnumSliderOptionEntry<FrameGenerationMode> frameGenerationEntry;
     private boolean contentTransitionRunning;
     private Frame outgoingContentFrame;
     private long contentTransitionStartMs;
@@ -1135,8 +1135,10 @@ public class MaterialConfigScreen extends NanoVGScreen<MaterialConfigScreen> {
                                         SuperResolutionConfig.setFrameGenerationProvider(description.getId()))
                                 .build();
 
+                        // Slider rather than a dropdown: an unlocked XeSS-FG build offers
+                        // up to X32, which no menu can display without scrolling off screen.
                         FrameGenerationMode[] modes = FrameGeneration.availableModes();
-                        frameGenerationEntry = builder.selectorOption(
+                        frameGenerationEntry = builder.sliderSelectorOption(
                                         Text.translatable("superresolution.screen.config.options.frame_generation"),
                                         FrameGeneration.displayedMode(),
                                         modes

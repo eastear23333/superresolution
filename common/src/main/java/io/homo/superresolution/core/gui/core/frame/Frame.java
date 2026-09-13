@@ -283,9 +283,9 @@ public class Frame implements IFrame {
     }
 
     @Override
-    public void dispatchMouseScroll(float x, float y, double scrollX) {
+    public boolean dispatchMouseScroll(float x, float y, double scrollX) {
         if (root == null || !root.isVisible()) {
-            return;
+            return false;
         }
 
         Vector2f mousePos = new Vector2f(x, y);
@@ -295,8 +295,9 @@ public class Frame implements IFrame {
         if (topInteractive != null) {
             Transform accumulatedTransform = calculateAccumulatedTransform(topInteractive);
             Vector2f localPos = accumulatedTransform.inverseTransformPoint(mousePos);
-            topInteractive.mouseScroll(localPos.x, localPos.y, scrollX);
+            return topInteractive.mouseScroll(localPos.x, localPos.y, scrollX);
         }
+        return false;
     }
 
     @Override

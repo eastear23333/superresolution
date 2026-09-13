@@ -157,11 +157,13 @@ public abstract class AbstractWidget<
     }
 
     @Override
-    public void mouseScroll(float x, float y, double scrollX) {
+    public boolean mouseScroll(float x, float y, double scrollX) {
         if (isDisabled()) {
-            return;
+            return false;
         }
-        eventBus.post(new MouseEvent.MouseScrollEvent(new Vector2f(x, y), (float) scrollX));
+        MouseEvent.MouseScrollEvent event = new MouseEvent.MouseScrollEvent(new Vector2f(x, y), (float) scrollX);
+        eventBus.post(event);
+        return event.isConsumed();
     }
 
     @Override

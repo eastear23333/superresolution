@@ -49,7 +49,11 @@ public interface IFrame {
 
     void dispatchMouseDrag(float mouseX, float mouseY, float dragX, float dragY, int button);
 
-    void dispatchMouseScroll(float x, float y, double scrollX);
+    /**
+     * @return true when a widget under the cursor consumed the scroll, so an
+     *         enclosing scrollable frame must not scroll the page as well.
+     */
+    boolean dispatchMouseScroll(float x, float y, double scrollX);
 
     void dispatchKeyPress(int keyCode, int scancode, int modifiers);
 

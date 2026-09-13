@@ -49,6 +49,7 @@ public class MouseEvent {
     public static class MouseScrollEvent extends Event {
         private final Vector2f mousePosition;
         private final float scrollY;
+        private boolean consumed = false;
 
         public MouseScrollEvent(Vector2f mousePosition, float scrollY) {
             this.mousePosition = mousePosition;
@@ -61,6 +62,19 @@ public class MouseEvent {
 
         public float getScrollY() {
             return scrollY;
+        }
+
+        /**
+         * Marks the scroll as handled by this widget. A consuming widget stops the
+         * enclosing scrollable frame from scrolling the page at the same time, which
+         * is what makes wheel-adjustable controls (sliders) usable inside a list.
+         */
+        public void consume() {
+            this.consumed = true;
+        }
+
+        public boolean isConsumed() {
+            return consumed;
         }
     }
 

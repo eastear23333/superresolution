@@ -68,8 +68,8 @@ public abstract class AbstractContainerWidget<T extends AbstractContainerWidget<
     }
 
     @Override
-    public void mouseScroll(float x, float y, double scrollX) {
-        super.mouseScroll(x, y, scrollX);
+    public boolean mouseScroll(float x, float y, double scrollX) {
+        return super.mouseScroll(x, y, scrollX);
     }
 
     @Override

@@ -212,11 +212,11 @@ public abstract class AbstractOptionEntry<VT, SELF> implements ValueHolder<VT>, 
     }
 
     @Override
-    public void mouseScroll(float x, float y, double scrollX) {
+    public boolean mouseScroll(float x, float y, double scrollX) {
         if (!container.isVisible()) {
-            return;
+            return false;
         }
-        container.mouseScroll(x, y, scrollX);
+        return container.mouseScroll(x, y, scrollX);
     }
 
     @Override

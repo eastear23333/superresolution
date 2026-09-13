@@ -74,6 +74,20 @@ public class OptionBuilder {
         return builder;
     }
 
+    /**
+     * Same choices as {@link #selectorOption}, but stepped through with a slider. Use
+     * this when the list is too long to fit in a menu.
+     */
+    public <T> EnumSliderBuilder<T, ?> sliderSelectorOption(
+            Text name,
+            T value,
+            T[] values
+    ) {
+        EnumSliderBuilder<T, ?> builder = new EnumSliderBuilder<>(name, value, values);
+        builder.setCategory(category);
+        return builder;
+    }
+
     public BooleanSwitchBuilder booleanOption(
             Text name,
             Boolean value
