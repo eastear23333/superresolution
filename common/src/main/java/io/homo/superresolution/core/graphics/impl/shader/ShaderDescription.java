@@ -98,8 +98,39 @@ public class ShaderDescription {
             return this;
         }
 
+        public Builder uniformBuffer(String name, int set, int binding, int bufferSize) {
+            description.resourcesLayout.addUniformBuffer(name, set, binding, bufferSize);
+            return this;
+        }
+
+        /// SSBO 绑定（GL: GL_SHADER_STORAGE_BUFFER；Vulkan: STORAGE_BUFFER descriptor）
+        public Builder storageBuffer(String name, int binding) {
+            description.resourcesLayout.addStorageBuffer(name, binding);
+            return this;
+        }
+
+        public Builder storageBuffer(String name, int set, int binding) {
+            description.resourcesLayout.addStorageBuffer(name, set, binding);
+            return this;
+        }
+
+        public Builder storageBuffer(String name, int binding, ShaderResourceAccess access) {
+            description.resourcesLayout.addStorageBuffer(name, binding, access);
+            return this;
+        }
+
+        public Builder storageBuffer(String name, int set, int binding, ShaderResourceAccess access) {
+            description.resourcesLayout.addStorageBuffer(name, set, binding, access);
+            return this;
+        }
+
         public Builder uniformSamplerTexture(String name, int binding) {
             description.resourcesLayout.addSamplerTexture(name, binding);
+            return this;
+        }
+
+        public Builder uniformSamplerTexture(String name, int set, int binding) {
+            description.resourcesLayout.addSamplerTexture(name, set, binding);
             return this;
         }
 
@@ -110,6 +141,11 @@ public class ShaderDescription {
 
         public Builder uniformStorageTexture(String name, int binding) {
             description.resourcesLayout.addStorageTexture(name, binding);
+            return this;
+        }
+
+        public Builder uniformStorageTexture(String name, int set, int binding) {
+            description.resourcesLayout.addStorageTextureInSet(name, set, binding);
             return this;
         }
 

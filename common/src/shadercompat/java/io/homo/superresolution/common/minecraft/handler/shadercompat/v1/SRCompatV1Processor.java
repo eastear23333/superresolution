@@ -28,6 +28,7 @@ import io.homo.superresolution.common.minecraft.handler.RenderHandlerManager;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.MacroRegistrar;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.SRCompatProcessor;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.SRShaderCompatData;
+import io.homo.superresolution.common.minecraft.handler.shadercompat.ShaderpackJitterCompensation;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.UniformRegistrar;
 import io.homo.superresolution.common.upscale.AlgorithmDescriptions;
 import io.homo.superresolution.common.upscale.AlgorithmManager;
@@ -89,7 +90,9 @@ public class SRCompatV1Processor implements SRCompatProcessor {
     @Override
     public Vector2f adaptJitterForShaderpack(Vector2f rawJitter, AbstractAlgorithm algorithm, SRShaderCompatData config, AlgorithmDescription<?> description) {
 
-        return rawJitter;
+        // 补偿光影 texelSize 用物理屏幕尺寸导致的幅度偏差
+        // （详见 ShaderpackJitterCompensation 的说明）。
+        return ShaderpackJitterCompensation.compensate(rawJitter);
     }
 
     @Override
@@ -233,7 +236,14 @@ public class SRCompatV1Processor implements SRCompatProcessor {
                             || IrisShaderCompatUtils.getCurrentConfig().get().jitter.source != SRShaderCompatData.JitterConfig.JitterSource.MOD) {
                         return new Vector2f(0);
                     }
-                    return new Vector2f(AlgorithmManager.getPreviousJitterOffset());
+                    Vector2f rawJitter = AlgorithmManager.getPreviousJitterOffset();
+                    // ★ 必须与 SRJitterOffset 走同一条适配路径。
+                    // 光影（如 Sundial）在 Deferred0.frag 里同时用这两个值算历史采样位置：
+                    //     sampleCoord += prevTaaOffset * offset - taaOffset * 0.5 * offset;
+                    // 且两者在光影内部施加的比例本身就不同（prev 无 2.0、curr 有 2.0）。
+                    // 若宿主侧只对 curr 做适配而 prev 原样传入，两帧的抖动空间不一致，
+                    // 每次历史采样都会带上固定偏移 —— 表现为画面「整体平移 + 抖动」。
+                    return adaptJitterForShaderpack(rawJitter, algorithm, config, description);
                 });
     }
 }

@@ -110,6 +110,14 @@ public enum TextureFormat {
             DataType.UNSIGNED_INTEGER,
             TextureComponent.R
     ),
+    RGBA32UI(
+            GL_RGBA32UI, VK_FORMAT_R32G32B32A32_UINT,
+            DataType.UNSIGNED_INTEGER,
+            TextureComponent.R,
+            TextureComponent.G,
+            TextureComponent.B,
+            TextureComponent.A
+    ),
     DEPTH32F(
             GL_DEPTH_COMPONENT32F, VK_FORMAT_D32_SFLOAT,
             DataType.FLOAT,
@@ -149,6 +157,11 @@ public enum TextureFormat {
             TextureComponent.R,
             TextureComponent.G,
             TextureComponent.B
+    ),
+    RGBA8_SNORM(
+            GL_RGBA8_SNORM, VK_FORMAT_R8G8B8A8_SNORM,
+            DataType.SIGNED_NORMALIZED,
+            TextureComponent.R, TextureComponent.G, TextureComponent.B, TextureComponent.A
     ),
     RGBA16_SNORM(
             GL_RGBA16_SNORM, VK_FORMAT_R16G16B16A16_SNORM,
@@ -239,7 +252,8 @@ public enum TextureFormat {
             case RG32F -> 8;
             case R32F, R32UI -> 4;
             case RGBA16F, RGBA16_SNORM, RGBA16 -> 8;
-            case RGBA32F -> 16;
+            case RGBA8_SNORM -> 4;
+            case RGBA32F, RGBA32UI -> 16;
             case RGB16F, DEPTH32F_STENCIL8 -> 6;
             case R11G11B10F -> 4;
             case DEPTH32F, DEPTH32, DEPTH_COMPONENT -> 4;
@@ -296,8 +310,10 @@ public enum TextureFormat {
             case R8 -> "r8";
             case R32F -> "r32f";
             case R32UI -> "r32ui";
+            case RGBA32UI -> "rgba32ui";
             case R16_SNORM -> "r16_snorm";
             case R11G11B10F -> "r11f_g11f_b10f";
+            case RGBA8_SNORM -> "rgba8_snorm";
             case RGBA16_SNORM -> "rgba16_snorm";
             default -> null;
         };

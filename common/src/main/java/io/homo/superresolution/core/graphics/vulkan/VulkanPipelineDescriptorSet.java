@@ -27,6 +27,8 @@ import io.homo.superresolution.core.graphics.impl.shader.uniform.ShaderResourceT
 import io.homo.superresolution.core.graphics.impl.texture.ITexture;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.LongBuffer;
 import java.util.ArrayList;
@@ -34,6 +36,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 import static io.homo.superresolution.core.graphics.vulkan.VulkanUtils.VK_CHECK;
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -41,8 +44,11 @@ import static org.lwjgl.vulkan.KHRPushDescriptor.VK_DESCRIPTOR_SET_LAYOUT_CREATE
 import static org.lwjgl.vulkan.VK10.*;
 
 public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
+    private static final Logger LOGGER = LoggerFactory.getLogger(VulkanPipelineDescriptorSet.class);
     private final VulkanDevice device;
-    private long descriptorSetLayout = VK_NULL_HANDLE;
+    /// 每个 Vulkan 描述符集合一个 layout。NSS 等移植 shader 用 set=0（采样器）+ set=1（SSBO）。
+    /// 索引即 set 号，未用到的 set 位置为 VK_NULL_HANDLE（管线布局里填 null 占位）。
+    private final Map<Integer, Long> descriptorSetLayouts = new TreeMap<>();
     private final Map<Integer, Long> samplerCache = new HashMap<>();
     private final DescriptorLayoutKey descriptorLayoutKey;
 
@@ -50,34 +56,62 @@ public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
         super(shader);
         this.device = device;
         this.descriptorLayoutKey = createDescriptorLayoutKey(shader.getDescription().resourcesLayout());
-        createDescriptorSetLayout();
+        createDescriptorSetLayouts();
     }
 
     private static int toVkDescriptorType(ShaderResourceType type) {
         return switch (type) {
             case UniformBuffer -> VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            case StorageBuffer -> VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             case SamplerTexture -> VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             case StorageTexture -> VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         };
     }
 
-    private void createDescriptorSetLayout() {
+    /// 为每个出现过的 set 单独建 layout。set 之间不能合并 ——
+    /// vkCmdPushDescriptorSetKHR 的 set 参数必须以 layout 为单位传，
+    /// 且管线布局要求 set 号连续（中间空洞用空 layout 占位）。
+    private void createDescriptorSetLayouts() {
         ShaderResourcesLayout layout = shader.getDescription().resourcesLayout();
-        Map<String, ShaderResourceDescription> resources = layout.getResources();
+        Map<Integer, List<ShaderResourceDescription>> grouped = layout.getResourcesBySet();
 
+        int maxSet = layout.maxSet();
+        /*
+         * 硬限制：本后端只通过 vkCmdPushDescriptorSetKHR 写描述符，从不调用
+         * vkCmdBindDescriptorSets。而 VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293
+         * 规定一个管线布局里最多只能有一个 set layout 带 PUSH_DESCRIPTOR 标志，
+         * 于是 set 数 > 1 时除 set 0 之外的 set 永远无法被真正绑定 ——
+         * 表现为 vkCmdDraw/vkCmdDispatch 报 None-08600「set n is not bound」，
+         * GPU 读到的是未初始化的描述符（画面全黑/无超分）而不是崩溃。
+         * 因此任何用到 set >= 1 的 shader 都必须合并到 set 0，这里显式报错。
+         */
+        if (maxSet > 0) {
+            LOGGER.error(
+                    "Shader '{}' 使用了 {} 个 descriptor set（maxSet={}），但本后端只支持单一 push descriptor set。"
+                            + " 请把所有资源合并到 set 0（用不同的 binding 号），否则 pipeline 布局会违反 "
+                            + "VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293 且 set 0 无法绑定。",
+                    shader.getDescription().shaderName(), grouped.size(), maxSet);
+        }
+        for (int set = 0; set <= maxSet; set++) {
+            // 空洞 set（布局里没资源但序号被占）也要建空 layout，否则管线布局 set 号会错位
+            List<ShaderResourceDescription> resources = grouped.getOrDefault(set, List.of());
+            descriptorSetLayouts.put(set, createDescriptorSetLayout(set, resources));
+        }
+    }
+
+    private long createDescriptorSetLayout(int set, List<ShaderResourceDescription> resources) {
         try (MemoryStack stack = stackPush()) {
             VkDescriptorSetLayoutBinding.Buffer layoutBindings =
                     VkDescriptorSetLayoutBinding.calloc(resources.size(), stack);
 
-            int i = 0;
-            for (ShaderResourceDescription res : resources.values()) {
+            for (int i = 0; i < resources.size(); i++) {
+                ShaderResourceDescription res = resources.get(i);
                 layoutBindings.get(i)
                         .binding(res.binding())
                         .descriptorType(toVkDescriptorType(res.type()))
                         .descriptorCount(1)
                         .stageFlags(VK_SHADER_STAGE_ALL)
                         .pImmutableSamplers(null);
-                i++;
             }
 
             VkDescriptorSetLayoutCreateInfo layoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
@@ -87,10 +121,37 @@ public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
 
             LongBuffer pLayout = stack.mallocLong(1);
             VK_CHECK(vkCreateDescriptorSetLayout(device.getVkDevice(), layoutInfo, null, pLayout),
-                    "Failed to create descriptor set layout");
-            descriptorSetLayout = pLayout.get(0);
-            device.setDebugName(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, descriptorSetLayout, "DescriptorSetLayout:" + shader.getDescription().shaderName());
+                    "Failed to create descriptor set layout (set=" + set + ")");
+            long handle = pLayout.get(0);
+            device.setDebugName(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, handle,
+                    "DescriptorSetLayout:" + shader.getDescription().shaderName() + ":set" + set);
+            return handle;
         }
+    }
+
+    /// 把多个 set 的 layout 组成供 vkCreatePipelineLayout 使用的数组，按 set 号升序。
+    public long[] getDescriptorSetLayouts() {
+        return descriptorSetLayouts.values().stream().mapToLong(Long::longValue).toArray();
+    }
+
+    /// 该 shader 用到的 set 数量。
+    public int getDescriptorSetCount() {
+        return descriptorSetLayouts.size();
+    }
+
+    /// 单个 set 的布局指纹。按 set 隔离，避免不同 set 之间互相误判"布局未变"。
+    private final Map<Integer, DescriptorLayoutKey> perSetLayoutKeys = new TreeMap<>();
+
+    private DescriptorLayoutKey layoutKeyForSet(int set) {
+        return perSetLayoutKeys.computeIfAbsent(set, s -> {
+            List<DescriptorLayoutBindingKey> keys = new ArrayList<>();
+            for (DescriptorLayoutBindingKey key : descriptorLayoutKey.bindings()) {
+                if (key.setIndex() == s) {
+                    keys.add(key);
+                }
+            }
+            return new DescriptorLayoutKey(List.copyOf(keys));
+        });
     }
 
     void pushDescriptorsIfNeeded(VulkanCommandBuffer commandBuffer, VkCommandBuffer cmd, int bindPoint, long pipelineLayout) {
@@ -99,18 +160,28 @@ public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
             return;
         }
 
-        List<DescriptorBindingSnapshotKey> requestedBindings = createDescriptorBindingSnapshotKeys();
-        List<DescriptorBindingSnapshotKey> bindingsToPush = commandBuffer.collectDescriptorUpdates(
-                bindPoint,
-                0,
-                descriptorLayoutKey,
-                requestedBindings
-        );
-        if (bindingsToPush.isEmpty()) {
-            dirty = false;
-            return;
+        // 按 set 分别推送：vkCmdPushDescriptorSetKHR 一次只处理一个 set
+        for (Map.Entry<Integer, List<DescriptorBindingSnapshotKey>> setEntry : collectSnapshotKeysBySet().entrySet()) {
+            int set = setEntry.getKey();
+            List<DescriptorBindingSnapshotKey> requestedBindings = setEntry.getValue();
+            DescriptorLayoutKey setLayoutKey = layoutKeyForSet(set);
+            List<DescriptorBindingSnapshotKey> bindingsToPush = commandBuffer.collectDescriptorUpdates(
+                    bindPoint,
+                    set,
+                    setLayoutKey,
+                    requestedBindings
+            );
+            if (bindingsToPush.isEmpty()) {
+                continue;
+            }
+            pushDescriptorSet(cmd, bindPoint, pipelineLayout, set, bindingsToPush);
+            commandBuffer.recordDescriptorPush(bindPoint, set, setLayoutKey, bindingsToPush);
         }
+        dirty = false;
+    }
 
+    private void pushDescriptorSet(VkCommandBuffer cmd, int bindPoint, long pipelineLayout, int set,
+                                   List<DescriptorBindingSnapshotKey> bindingsToPush) {
         try (MemoryStack stack = stackPush()) {
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(bindingsToPush.size(), stack);
 
@@ -129,6 +200,15 @@ public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
                                 .offset(binding.bufferOffset())
                                 .range(binding.bufferRange());
                         write.descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+                                .pBufferInfo(bufferInfo);
+                    }
+                    // SSBO：与 UBO 同为 buffer descriptor，仅类型不同
+                    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER -> {
+                        VkDescriptorBufferInfo.Buffer bufferInfo = VkDescriptorBufferInfo.calloc(1, stack)
+                                .buffer(binding.buffer())
+                                .offset(binding.bufferOffset())
+                                .range(binding.bufferRange());
+                        write.descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                                 .pBufferInfo(bufferInfo);
                     }
                     case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER -> {
@@ -151,10 +231,8 @@ public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
                 }
             }
 
-            KHRPushDescriptor.vkCmdPushDescriptorSetKHR(cmd, bindPoint, pipelineLayout, 0, writes);
+            KHRPushDescriptor.vkCmdPushDescriptorSetKHR(cmd, bindPoint, pipelineLayout, set, writes);
         }
-        commandBuffer.recordDescriptorPush(bindPoint, 0, descriptorLayoutKey, bindingsToPush);
-        dirty = false;
     }
 
     boolean needsPush() {
@@ -233,8 +311,8 @@ public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
         return "DescriptorSampler filter=" + filterMode + " wrap=" + wrapMode;
     }
 
-    public long getDescriptorSetLayout() {
-        return descriptorSetLayout;
+    public List<Long> getDescriptorSetLayoutList() {
+        return new ArrayList<>(descriptorSetLayouts.values());
     }
 
     public DescriptorLayoutKey getDescriptorLayoutKey() {
@@ -253,18 +331,19 @@ public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
             }
         }
         samplerCache.clear();
-        long descriptorSetLayoutToDestroy = descriptorSetLayout;
-        descriptorSetLayout = VK_NULL_HANDLE;
-        if (descriptorSetLayoutToDestroy != VK_NULL_HANDLE) {
-            device.queueForDestroy(() -> vkDestroyDescriptorSetLayout(device.getVkDevice(), descriptorSetLayoutToDestroy, null));
+        for (long layout : descriptorSetLayouts.values()) {
+            if (layout != VK_NULL_HANDLE) {
+                device.queueForDestroy(() -> vkDestroyDescriptorSetLayout(device.getVkDevice(), layout, null));
+            }
         }
+        descriptorSetLayouts.clear();
     }
 
     private static DescriptorLayoutKey createDescriptorLayoutKey(ShaderResourcesLayout layout) {
         List<DescriptorLayoutBindingKey> bindingKeys = new ArrayList<>();
         for (ShaderResourceDescription res : layout.getResources().values()) {
             bindingKeys.add(new DescriptorLayoutBindingKey(
-                    0,
+                    res.set(),
                     res.binding(),
                     toVkDescriptorType(res.type()),
                     1,
@@ -277,60 +356,82 @@ public class VulkanPipelineDescriptorSet extends PipelineDescriptorSet {
         return new DescriptorLayoutKey(List.copyOf(bindingKeys));
     }
 
-    private List<DescriptorBindingSnapshotKey> createDescriptorBindingSnapshotKeys() {
-        List<DescriptorBindingSnapshotKey> snapshotKeys = new ArrayList<>();
+    /// 按 set 分组生成快照 key。set 号取自资源布局（binding 时已解析进 ResourceBinding）。
+    private Map<Integer, List<DescriptorBindingSnapshotKey>> collectSnapshotKeysBySet() {
+        Map<Integer, List<DescriptorBindingSnapshotKey>> grouped = new TreeMap<>();
         for (Map.Entry<String, ResourceBinding> entry : bindings.entrySet()) {
             ResourceBinding binding = entry.getValue();
-            switch (binding.type()) {
-                case UNIFORM_BUFFER -> {
-                    IBuffer buffer = (IBuffer) binding.resource();
-                    snapshotKeys.add(new DescriptorBindingSnapshotKey(
-                            binding.bindingPoint(),
-                            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                            buffer.handle(),
-                            binding.offset(),
-                            binding.range(),
-                            0L,
-                            0,
-                            0L
-                    ));
-                }
-                case SAMPLER_TEXTURE -> {
-                    ITexture texture = (ITexture) binding.resource();
-                    long imageView = resolveImageView(texture);
-                    long sampler = binding.sampler() != null
-                            ? binding.sampler().handle()
-                            : getOrCreateSamplerForTexture(texture);
-                    snapshotKeys.add(new DescriptorBindingSnapshotKey(
-                            binding.bindingPoint(),
-                            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                            0L,
-                            0L,
-                            0L,
-                            imageView,
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            sampler
-                    ));
-                }
-                case STORAGE_IMAGE -> {
-                    ITexture texture = (ITexture) binding.resource();
-                    long imageView = resolveStorageImageView(texture);
-                    snapshotKeys.add(new DescriptorBindingSnapshotKey(
-                            binding.bindingPoint(),
-                            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                            0L,
-                            0L,
-                            0L,
-                            imageView,
-                            VK_IMAGE_LAYOUT_GENERAL,
-                            0L
-                    ));
-                }
-            }
+            List<DescriptorBindingSnapshotKey> list =
+                    grouped.computeIfAbsent(binding.setIndex(), k -> new ArrayList<>());
+            list.add(createSnapshotKey(binding));
         }
-        snapshotKeys.sort(Comparator.comparingInt(DescriptorBindingSnapshotKey::binding)
-                .thenComparingInt(DescriptorBindingSnapshotKey::descriptorType));
-        return List.copyOf(snapshotKeys);
+        for (List<DescriptorBindingSnapshotKey> list : grouped.values()) {
+            list.sort(Comparator.comparingInt(DescriptorBindingSnapshotKey::binding));
+        }
+        return grouped;
+    }
+
+    private DescriptorBindingSnapshotKey createSnapshotKey(ResourceBinding binding) {
+        return switch (binding.type()) {
+            case UNIFORM_BUFFER -> {
+                IBuffer buffer = (IBuffer) binding.resource();
+                yield new DescriptorBindingSnapshotKey(
+                        binding.bindingPoint(),
+                        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                        buffer.handle(),
+                        binding.offset(),
+                        binding.range(),
+                        0L,
+                        0,
+                        0L
+                );
+            }
+            // SSBO：与 UBO 同形，仅 descriptor type 不同
+            case STORAGE_BUFFER -> {
+                IBuffer buffer = (IBuffer) binding.resource();
+                yield new DescriptorBindingSnapshotKey(
+                        binding.bindingPoint(),
+                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        buffer.handle(),
+                        binding.offset(),
+                        binding.range(),
+                        0L,
+                        0,
+                        0L
+                );
+            }
+            case SAMPLER_TEXTURE -> {
+                ITexture texture = (ITexture) binding.resource();
+                long imageView = resolveImageView(texture);
+                long sampler = binding.sampler() != null
+                        ? binding.sampler().handle()
+                        : getOrCreateSamplerForTexture(texture);
+                yield new DescriptorBindingSnapshotKey(
+                        binding.bindingPoint(),
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        0L,
+                        0L,
+                        0L,
+                        imageView,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        sampler
+                );
+            }
+            case STORAGE_IMAGE -> {
+                ITexture texture = (ITexture) binding.resource();
+                long imageView = resolveStorageImageView(texture);
+                yield new DescriptorBindingSnapshotKey(
+                        binding.bindingPoint(),
+                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                        0L,
+                        0L,
+                        0L,
+                        imageView,
+                        VK_IMAGE_LAYOUT_GENERAL,
+                        0L
+                );
+            }
+        };
     }
 
     public record DescriptorLayoutKey(List<DescriptorLayoutBindingKey> bindings) {

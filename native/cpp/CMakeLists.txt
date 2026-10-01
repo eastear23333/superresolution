@@ -13,6 +13,7 @@ set(SR_D3D12_INTEROP "${SR_D3D12}" CACHE BOOL
 option(SR_XESS "启用以支持XESS" ON)
 option(SR_NGX "启用以支持NGX绑定" ON)
 option(SR_STREAMLINE "启用以支持Streamline" ON)
+option(SR_NSS "启用以支持Arm NSS神经超分" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -105,4 +106,8 @@ endif()
 
 if(SR_STREAMLINE AND ON_WINDOWS)
     add_subdirectory("SRNativeStreamline")
+endif()
+
+if(SR_NSS)
+    add_subdirectory("SRNativeNSS")
 endif()

@@ -35,6 +35,7 @@ import io.homo.superresolution.common.minecraft.handler.RenderHandlerManager;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.MacroRegistrar;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.SRCompatProcessor;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.SRShaderCompatData;
+import io.homo.superresolution.common.minecraft.handler.shadercompat.ShaderpackJitterCompensation;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.UniformRegistrar;
 import io.homo.superresolution.common.upscale.AlgorithmDescriptions;
 import io.homo.superresolution.common.upscale.AlgorithmManager;
@@ -116,16 +117,20 @@ public class SRCompatV2Processor implements SRCompatProcessor {
 
     @Override
     public Vector2f adaptJitterForShaderpack(Vector2f rawJitter, AbstractAlgorithm algorithm, SRShaderCompatData config, AlgorithmDescription<?> description) {
+        Vector2f adapted;
         if (
                 description.equals(AlgorithmDescriptions.FSR) ||
                         description.equals(AlgorithmDescriptions.DLSS) ||
                         description.equals(AlgorithmDescriptions.XESS)||
                         description.equals(AlgorithmDescriptions.FSR4_D3D12)
         ) {
-            return rawJitter.mul(1, -1);
-        }else {
-            return rawJitter;
+            adapted = rawJitter.mul(1, -1);
+        } else {
+            adapted = rawJitter;
         }
+        // 补偿光影 texelSize 用物理屏幕尺寸导致的幅度偏差
+        // （详见 ShaderpackJitterCompensation 的说明）。
+        return ShaderpackJitterCompensation.compensate(adapted);
     }
 
     @Override

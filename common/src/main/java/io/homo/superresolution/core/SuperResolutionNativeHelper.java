@@ -18,14 +18,12 @@
 
 package io.homo.superresolution.core;
 
+import io.homo.superresolution.core.graphics.vulkan.VkReflectionHelper;
 import io.homo.superresolution.core.graphics.vulkan.VulkanDevice;
 import org.lwjgl.glfw.GLFW;
-import org.lwjgl.vulkan.VK;
 import org.lwjgl.vulkan.VK10;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.lang.reflect.InvocationTargetException;
 
 public class SuperResolutionNativeHelper {
     public static final Logger LOGGER_CPP = LoggerFactory.getLogger("SuperResolution/Native");
@@ -48,12 +46,12 @@ public class SuperResolutionNativeHelper {
             return RenderSystems.vulkan().getVulkanInstance().address();
         }
         if (name.equals("SuperResolution_VkGetInstanceProcAddr")) {
-            Class<VK> clazz = VK.class;
-            try {
-                return (long) clazz.getDeclaredMethod("getGlobalCommands").invoke(null).getClass().getField("vkGetInstanceProcAddr").get(null);
-            } catch (IllegalAccessException | NoSuchFieldException | InvocationTargetException | NoSuchMethodException e) {
-                throw new RuntimeException(e);
-            }
+            // 走统一的反射工具。原来这里用 getDeclaredMethod + getField 的裸反射，
+            // 而 LWJGL 的 getGlobalCommands() 与 vkGetInstanceProcAddr 字段都是包私有
+            // （3.4.x 起字段还是 final），getField() 只认 public 字段必然失败，
+            // 结果一路传 0 给 native，导致 NSS/DP4A 初始化时报
+            // "vkGetInstanceProcAddr 失败 / vulkan call failed"。
+            return VkReflectionHelper.getVkGetInstanceProcAddr();
         }
         return VK10.vkGetDeviceProcAddr(
                 RenderSystems.vulkan().device().getVkDevice(),

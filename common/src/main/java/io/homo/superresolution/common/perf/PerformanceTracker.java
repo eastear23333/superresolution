@@ -31,6 +31,19 @@ public class PerformanceTracker {
     public static final String GL_INTEROP_FLIP = "GL Interop Flip";
     public static final String GL_CAPTURE_FLIP = "GL Capture Flip";
     public static final String GL_INPUT_CONVERT = "GL Input Convert";
+    // Arm NSS 分段耗时（VulkanTimestampProfiler 上报）。VK_NSS_TOTAL 与 DLSS 的
+    // VK_UPSCALE 同口径，可直接对比；其余三段用于定位开销集中在哪一段。
+    // NSS 前置段细分（实测发现前置占 ~6ms，故拆开定位）
+    public static final String VK_NSS_SETUP = "NSS Setup";
+    public static final String VK_NSS_SCATTER_INIT = "NSS ScatterInit";
+    public static final String VK_NSS_SCATTER = "NSS Scatter";
+    public static final String VK_NSS_DISOCC = "NSS Disocc";
+    public static final String VK_NSS_PREPROCESS = "NSS Preprocess";
+    public static final String VK_NSS_INFERENCE = "NSS Inference";
+    // 实测：后处理窗口内出现 ~5.7ms 等待，故拆开定位。
+    public static final String VK_NSS_TEMPORAL = "NSS TemporalConv";
+    public static final String VK_NSS_POSTPROC = "NSS PostProc";
+    public static final String VK_NSS_PRESENT = "NSS Present";
 
     private static final int MAX_RESULT = 256;
     private static final Object2ObjectOpenHashMap<String, TrackerContext> contextMap = new Object2ObjectOpenHashMap<>();
@@ -48,6 +61,15 @@ public class PerformanceTracker {
         addExternalGpuOperation(VK_UPSCALE);
         addExternalGpuOperation(VK_FRAME_GEN);
         addExternalGpuOperation(VK_PRESENT_BLIT);
+        addExternalGpuOperation(VK_NSS_SETUP);
+        addExternalGpuOperation(VK_NSS_SCATTER_INIT);
+        addExternalGpuOperation(VK_NSS_SCATTER);
+        addExternalGpuOperation(VK_NSS_DISOCC);
+        addExternalGpuOperation(VK_NSS_PREPROCESS);
+        addExternalGpuOperation(VK_NSS_INFERENCE);
+        addExternalGpuOperation(VK_NSS_TEMPORAL);
+        addExternalGpuOperation(VK_NSS_POSTPROC);
+        addExternalGpuOperation(VK_NSS_PRESENT);
         addOperation(GL_INTEROP_FLIP);
         addOperation(GL_CAPTURE_FLIP);
         addOperation(GL_INPUT_CONVERT);

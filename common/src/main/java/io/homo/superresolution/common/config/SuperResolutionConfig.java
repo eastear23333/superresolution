@@ -24,6 +24,7 @@ import io.homo.superresolution.api.config.ModConfigSpec;
 import io.homo.superresolution.api.config.ModConfigSpecBuilder;
 import io.homo.superresolution.api.config.values.list.StringListValue;
 import io.homo.superresolution.api.config.values.single.BooleanValue;
+import io.homo.superresolution.api.config.values.single.IntValue;
 import io.homo.superresolution.api.config.values.single.EnumValue;
 import io.homo.superresolution.api.config.values.single.FloatValue;
 import io.homo.superresolution.api.config.values.single.StringValue;
@@ -97,6 +98,14 @@ public class SuperResolutionConfig {
     public static final StringValue FRAME_GENERATION_PROVIDER;
     public static final StringValue FRAME_GENERATION_BACKEND;
     public static final BooleanValue FLIP_VK_GL_INTEROP_RESOURCES_Y;
+    public static final FloatValue NSS_MOTION_VECTOR_SCALE;
+    public static final FloatValue SHADERPACK_JITTER_SCALE;
+    public static final BooleanValue NSS_PREPARE_RESOURCES_BEFORE_PASS;
+    public static final BooleanValue NSS_FORCE_HISTORY_RESET;
+    public static final BooleanValue NSS_DISABLE_JITTER;
+    public static final IntValue NSS_JITTER_SIGN_MODE;
+    public static final BooleanValue NSS_FORCE_HISTORY_CLAMP;
+    public static final FloatValue NSS_HISTORY_THETA_MAX;
     public static final BooleanValue ENABLE_EXPERIMENTAL_ALGORITHMS;
     public static final BooleanValue ENABLE_DLSS_RAY_RECONSTRUCTION;
     public static final BooleanValue ENABLE_OPTISCALER;
@@ -178,6 +187,179 @@ public class SuperResolutionConfig {
                 "flip_vk_gl_interop_resources_y",
                 () -> false,
                 "Flip Vulkan-OpenGL interop upscaling resources on the Y axis"
+        );
+        /*
+         * Arm NSS 的重投影在 shader 里与官方一致写成
+         *     `reproj_uv = uv + motion * InvDims`（**加号**，见 ffx_nss_preprocess.h:890、
+         *     ffx_nss_postprocess.h:778）；
+         * 官方示例传 `motionVectorScale = -renderSize`，经 scale 后 motion 成为
+         * **backward 屏幕空间像素位移**（user_guide.md:807）。
+         * 而 SR 的光影接口原样搬运光影的 motion buffer（backward 归一化 UV，
+         * 且 Sundial 这类光影在 `#if SR_ENABLE` 下还多乘了一次 upscaleRatio）。
+         * 因此宿主只需补 **幅度** 因子 `renderSize ÷ upscaleRatio`
+         * （= `renderSize × render / screen`），**符号不要动** —— 由 shader 侧的 `+` 决定。
+         *
+         * ★ 教训：此处注释曾误写成「三个 shader 都是 `uv - motion`（减号）」，
+         *   那是**对自身代码的循环论证**（把自己写的减号当成官方事实），
+         *   并据此在宿主侧补负号 → 两次翻转抵消，净效果为零。
+         *   若再"发现抖动"就加负号，会重犯此错。
+         *
+         * 这里保留一个可调倍率用于对照测试：
+         *   1.0  = 上面推导出的默认值（推荐）
+         *  -1.0  = 翻转重投影方向（仅用于诊断「拖影方向是否相反」）
+         *   0.0  = 完全关闭重投影
+         *  0.5 / 2.0 = 验证光影是否多乘/少乘了 upscaleRatio
+         */
+        NSS_MOTION_VECTOR_SCALE = builder.defineFloat(
+                "nss_motion_vector_scale",
+                () -> 1.0f,
+                "Arm NSS: multiplier applied when converting the shader pack motion-vector buffer "
+                        + "into Arm's expected backward screen-space pixel displacement. "
+                        + "1.0 = derived default; -1.0 = flip direction; 0 = disable reprojection (debug).",
+                value -> value != null && value >= -64.0f && value <= 64.0f
+        );
+
+        /*
+         * ───────────── 光影侧 jitter 幅度补偿（默认关闭） ─────────────
+         *
+         * 光影（以 Sundial 系为例）把 jitter 交给 SR 提供：
+         *
+         *   shaders.properties:  uniform.vec2.texelSize = vec2(1.0 / viewWidth, 1.0 / viewHeight)
+         *   libs/Uniform.glsl:   vec2 taaOffset = SRJitterOffset * texelSize * 2.0 * vec2(1.0, -1.0);
+         *   programs/gbuffers/*.vert:  gl_Position.xy += taaOffset * gl_Position.w;
+         *
+         * ★ 实证结论（2026-09-25，实测注入后抖动加剧，已回退）：
+         * Iris 的 `viewWidth`/`viewHeight` 是**当前 pass 的 render target 尺寸**
+         * （见 irisapi NewCompositeRenderer: `pass.viewWidth = passWidth = target.getWidth()`），
+         * 在 SR 环境下即**渲染分辨率**（960x495 实测），而不是物理窗口尺寸。
+         * 于是：
+         *     taaOffset_ndc      = SRJitterOffset * (1 / renderSize) * 2
+         *     几何位移(渲染像素) = taaOffset_ndc * renderSize / 2 = SRJitterOffset
+         * 即光影施加的位移**本来就等于**算法侧收到的 `_JitterOffset`，无需补偿。
+         * 曾按「screenSize = 物理窗口」的假设乘过 upscaleRatio，结果 jitter 翻倍、
+         * 画面剧烈抖动 —— 因此本项默认 0.0（关闭）。
+         *
+         * 保留该开关仅用于将来排查其他光影变体：
+         *   0.0  = 不补偿（默认，正确行为）
+         *   1.0  = 按 screenSize / renderSize 补偿
+         *  -1.0  = 补偿且取反
+         *   其它 = 固定倍率
+         */
+        SHADERPACK_JITTER_SCALE = builder.defineFloat(
+                "shaderpack_jitter_scale",
+                () -> 0.0f,
+                "Multiplier for the jitter handed to the shader pack's SRJitterOffset. "
+                        + "0.0 = raw, no compensation (default and correct: Iris viewWidth is the pass "
+                        + "render-target size, so the shader pack already applies the right amount); "
+                        + "1.0 = compensate by screenSize/renderSize; -1.0 = compensate and flip; "
+                        + "any other value = fixed multiplier.",
+                value -> value != null && value >= -64.0f && value <= 64.0f
+        );
+
+        /*
+         * NSS 的图形 pass 里，采样纹理的布局转换默认发生在 render pass **内部**
+         * （VulkanCommandDecoder.bindPipeline -> prepareDescriptorResources），
+         * 这违反 VUID-vkCmdPipelineBarrier-oldLayout-01181（pass 内 barrier 的
+         * oldLayout 必须等于 newLayout）。驱动拒绝该 barrier，但状态跟踪仍被
+         * 乐观更新，导致后续采样读到未转换布局的陈旧数据 —— 表现为抖动/闪烁。
+         *
+         * 开启本项后，会在 beginRenderPass 之前先把采样纹理转换到位，
+         * pass 内那次因状态已一致而变成空操作。
+         *   true  = pass 前预转换（默认，符合规范）
+         *   false = 保持旧行为（对照测试用）
+         */
+        NSS_PREPARE_RESOURCES_BEFORE_PASS = builder.defineBoolean(
+                "nss_prepare_resources_before_pass",
+                () -> true,
+                "Arm NSS: transition sampled textures to their target layout before beginRenderPass "
+                        + "instead of inside the render pass (avoids illegal in-pass pipeline barriers "
+                        + "that make the driver drop the transition and leave stale texture layouts)."
+        );
+
+        /*
+         * ───── NSS 抖动排查开关（仅诊断，正常游戏保持 false） ─────
+         *
+         * 打开后每帧把 NSS 的 reset 置 true（历史全部丢弃、每帧重建）。
+         * 用来把抖动来源二分：
+         *   抖动消失 → 时序/history 累积链路（重投影、反馈乒乓、luma 历史）
+         *   抖动依旧 → 单帧链路（张量打包、推理、后处理混合、布局转换）
+         *
+         * ★ 性能警告：reset 帧会复现官方 ffx_nss.cpp:1506-1528 的 GPU 清空，
+         *   一次清 7 张纹理共约 23.5 MB（1080p）。正常游戏只在世界加载/传送时
+         *   触发，可忽略；但本开关打开后**每帧**都清 → 约 1.4 GB/s 额外写入，
+         *   帧率会明显下降。这是诊断开关的固有代价，不是 bug。
+         */
+        NSS_FORCE_HISTORY_RESET = builder.defineBoolean(
+                "nss_force_history_reset",
+                () -> false,
+                "Arm NSS (diagnostic): force reset=true every frame so history is rebuilt from scratch. "
+                        + "Use only to bisect jitter source; keep false for normal play. "
+                        + "NOTE: each reset frame GPU-clears ~23.5MB of history resources, "
+                        + "so leaving this on costs ~1.4GB/s of extra writes."
+        );
+
+        /*
+         * ───────────── NSS 稳定模式开关（2026-09-27 抖动/鬼影攻坚的产物） ─────────────
+         *
+         * 背景：本轮二分实验（jitter 归零 / 取反、unjitter 取反、theta=0）定位到
+         *   1) jitter 存在即微抖（与符号、theta、unjitter 方向均无关）
+         *      ⇒ 根因在「jittered 输入 → KPN 推理 → 输出网格」的系统性映射，
+         *         与鬼影（theta 异常）大概率同源：KPN 输入张量的 feedback/history 通道。
+         *   2) theta 强制收缩（=0）实测可完全压制鬼影。
+         *
+         * 在 KPN 输入链修复前，以下两项默认开启（稳定优先）：
+         */
+        NSS_DISABLE_JITTER = builder.defineBoolean(
+                "nss_disable_jitter",
+                () -> true,
+                "Arm NSS: disable the sub-pixel jitter sequence entirely (both shader-pack "
+                        + "SRJitterOffset and NSS _JitterOffset). Eliminates the residual micro-jitter "
+                        + "observed with jittered input (root cause under investigation in the KPN "
+                        + "input chain). Cost: no sub-pixel sampling, slightly lower upscale sharpness. "
+                        + "Re-enable after the KPN input-chain fix."
+        );
+
+        /*
+         * ───────────── jitter 符号实验矩阵（抖动排查用，诊断开关） ─────────────
+         *
+         * 背景：jitter 启用时仍有残余抖动（_LutOffset 修复后依旧）。嫌疑：
+         * 光影施加几何抖动时带 (1,-1) 的 y 翻转（taaOffset = SRJitterOffset
+         * × texelSize × 2 × vec2(1.0,-1.0)），而 NSS 内部消费 jitter
+         * （unjitter / LUT 生成 / motion）时未同步该翻转 —— 符号约定错配。
+         *
+         * 本开关对「传入 NSS 的 jitter 向量」施加符号变换（x/y 独立翻转）：
+         *   0 = ( jx,  jy)  原样（当前行为，基线）
+         *   1 = ( jx, -jy)  仅 y 翻转（对应光影的 (1,-1)）
+         *   2 = (-jx,  jy)  仅 x 翻转
+         *   3 = (-jx, -jy)  全翻转
+         * 请依次测试 0→3，报告哪个档位下静止场景不再抖动。
+         * 定位后此开关将被具体的符号修正替代。
+         */
+        NSS_JITTER_SIGN_MODE = builder.defineInt(
+                "nss_jitter_sign_mode",
+                () -> 0,
+                "Arm NSS (diagnostic): sign transform applied to the jitter vector fed "
+                        + "into NSS. 0=(+x,+y) raw, 1=(+x,-y), 2=(-x,+y), 3=(-x,-y). "
+                        + "Cycle 0-3 and report which mode stops the residual jitter.",
+                v -> v != null && v >= 0 && v <= 3
+        );
+        NSS_FORCE_HISTORY_CLAMP = builder.defineBoolean(
+                "nss_force_history_clamp",
+                () -> true,
+                "Arm NSS: clamp theta in ClampHistoryToStats to NSS_HISTORY_THETA_MAX so abnormally "
+                        + "high history-trust (ghosting) is suppressed while normal pixels keep their "
+                        + "temporal smoothing. Measured to remove the on-screen ghosting caused by "
+                        + "abnormal theta output (KPN input-chain root cause). Re-enable full theta "
+                        + "after the KPN input-chain fix."
+        );
+        NSS_HISTORY_THETA_MAX = builder.defineFloat(
+                "nss_history_theta_max",
+                () -> 0.5f,
+                "Upper bound for theta when nss_force_history_clamp is on. "
+                        + "Lower = stronger anti-ghosting but noisier (weaker temporal denoising); "
+                        + "higher = smoother but ghosting may reappear. 0.0 equals the old "
+                        + "force-clamp behavior; tune between 0.3 and 0.8.",
+                value -> value != null && value >= 0.0f && value <= 1.0f
         );
 
         THEME = builder.defineEnum(
@@ -755,6 +937,107 @@ public class SuperResolutionConfig {
 
     public static boolean isFlipVkGlInteropResourcesY() {
         return FLIP_VK_GL_INTEROP_RESOURCES_Y.get();
+    }
+
+    public static float getNssMotionVectorScale() {
+        try {
+            Float v = NSS_MOTION_VECTOR_SCALE.get();
+            return v != null ? v : 1.0f;
+        } catch (Throwable t) {
+            return 1.0f;
+        }
+    }
+
+    /**
+     * 光影侧 {@code SRJitterOffset} 的补偿倍率（详见 {@link #SHADERPACK_JITTER_SCALE} 的说明）。
+     *
+     * @return 0.0 表示不补偿（默认且为正确行为）；1.0 表示按 {@code screenSize / renderSize}
+     * 补偿；其余值（含负值）直接作为固定倍率使用。
+     */
+    public static float getShaderpackJitterScale() {
+        try {
+            Float v = SHADERPACK_JITTER_SCALE.get();
+            return v != null ? v : 0.0f;
+        } catch (Throwable t) {
+            return 0.0f;
+        }
+    }
+
+    /**
+     * NSS 图形 pass 是否在 {@code beginRenderPass} 之前预转换采样纹理布局。
+     *
+     * @return 默认 {@code true}，避免 render pass 内的非法 image barrier。
+     */
+    public static boolean isNssPrepareResourcesBeforePass() {
+        try {
+            Boolean v = NSS_PREPARE_RESOURCES_BEFORE_PASS.get();
+            return v == null || v;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /**
+     * 诊断开关：每帧强制把 NSS 历史视为失效（{@code reset = true}）。
+     *
+     * <p>用途是把抖动来源二分：
+     * <ul>
+     *   <li>打开后抖动消失 → 问题在<b>时序/history 累积链路</b>
+     *       （重投影、反馈张量乒乓、luma 导数历史）。</li>
+     *   <li>打开后抖动依旧 → 问题在<b>单帧链路</b>
+     *       （预处理的张量打包、推理后端、后处理混合、布局转换）。</li>
+     * </ul>
+     * 仅在排查时开启，正常游戏务必保持 {@code false}（每帧重置会让画面失去时序信息）。
+     *
+     * @return 默认 {@code false}。
+     */
+    public static boolean isNssForceHistoryReset() {
+        try {
+            Boolean v = NSS_FORCE_HISTORY_RESET.get();
+            return v != null && v;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** {@code true} = 全链禁用 jitter（稳定模式，见 NSS_DISABLE_JITTER 注释）。 */
+    public static boolean isNssDisableJitter() {
+        try {
+            Boolean v = NSS_DISABLE_JITTER.get();
+            return v != null && v;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** jitter 符号实验模式（0-3），见 {@code nss_jitter_sign_mode}。 */
+    public static int getNssJitterSignMode() {
+        try {
+            Integer v = NSS_JITTER_SIGN_MODE.get();
+            return v != null ? v : 0;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /** {@code true} = ClampHistoryToStats 强制 theta 上限钳制（稳定模式，见 NSS_FORCE_HISTORY_CLAMP 注释）。 */
+    public static boolean isNssForceHistoryClamp() {
+        try {
+            Boolean v = NSS_FORCE_HISTORY_CLAMP.get();
+            return v != null && v;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** theta 上限（稳定模式，见 NSS_HISTORY_THETA_MAX 注释）。 */
+    public static float getNssHistoryThetaMax() {
+        try {
+            Float v = NSS_HISTORY_THETA_MAX.get();
+            return v != null ? v : 0.5f;
+        } catch (Throwable t) {
+            return 0.5f;
+        }
     }
 
     public static void setFlipVkGlInteropResourcesY(boolean value) {

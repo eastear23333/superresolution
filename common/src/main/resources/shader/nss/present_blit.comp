@@ -1,0 +1,28 @@
+//
+// NSS 输出呈现：把本帧的 NSS 输出（自产 history 纹理）写进互操作的 OutputColor。
+//
+// 为什么用 compute 而不是 graphics pass：
+//   互操作纹理的 usage 集合是 Sampler + Storage + TransferDestination，不含
+//   color attachment；而且框架在提交后告诉 GL 侧「该纹理处于 GENERAL 布局」
+//   （`upscaleFinishSemaphore.waitVulkanSignal(..., GL_LAYOUT_GENERAL_EXT)`），
+//   只有 storage image 写入才会把纹理留在 GENERAL。用 render pass 会把它留在
+//   COLOR_ATTACHMENT_OPTIMAL，与 GL 侧的假设不一致。
+//
+// 尺寸相同、逐像素 1:1，因此用 texelFetch 直取（无过滤、无边界语义）。
+//
+
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D _Source;
+layout(set = 0, binding = 1, DEST_FORMAT) uniform writeonly image2D _Dest;
+
+void main() {
+    ivec2 size = imageSize(_Dest);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+    imageStore(_Dest, pixel, vec4(texelFetch(_Source, pixel, 0).rgb, 1.0));
+}

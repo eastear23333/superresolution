@@ -48,33 +48,62 @@ public abstract class PipelineDescriptorSet {
     }
 
     public PipelineDescriptorSet uniformBuffer(String name, int binding, IBuffer buffer) {
-        bindings.put(name, new ResourceBinding(ResourceType.UNIFORM_BUFFER, binding, buffer, null, 0L, buffer.getSize()));
+        bindings.put(name, new ResourceBinding(ResourceType.UNIFORM_BUFFER, resolveSetIndex(name), binding, buffer, null, 0L, buffer.getSize()));
         dirty = true;
         return this;
     }
 
     public PipelineDescriptorSet uniformBufferRange(String name, int binding, IBuffer buffer, long offset, long range) {
-        bindings.put(name, new ResourceBinding(ResourceType.UNIFORM_BUFFER, binding, buffer, null, offset, range));
+        bindings.put(name, new ResourceBinding(ResourceType.UNIFORM_BUFFER, resolveSetIndex(name), binding, buffer, null, offset, range));
         dirty = true;
         return this;
     }
 
+    /// SSBO 绑定。NSS 的 12ch int8 输入张量 / KPN 参数用它。
+    /// GL: glBindBufferBase(GL_SHADER_STORAGE_BUFFER, ...)；
+    /// Vulkan: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER（range 传 0 表示 VK_WHOLE_SIZE）。
+    public PipelineDescriptorSet storageBuffer(String name, int binding, IBuffer buffer) {
+        bindings.put(name, new ResourceBinding(ResourceType.STORAGE_BUFFER, resolveSetIndex(name), binding, buffer, null, 0L, buffer.getSize()));
+        dirty = true;
+        return this;
+    }
+
+    public PipelineDescriptorSet storageBufferRange(String name, int binding, IBuffer buffer, long offset, long range) {
+        bindings.put(name, new ResourceBinding(ResourceType.STORAGE_BUFFER, resolveSetIndex(name), binding, buffer, null, offset, range));
+        dirty = true;
+        return this;
+    }
+
+    /// 绑定序号从 shader 资源布局推断（推荐用法，避免与声明漂移）。
+    public PipelineDescriptorSet storageBuffer(String name, IBuffer buffer) {
+        return storageBuffer(name, getBinding(name), buffer);
+    }
+
     public PipelineDescriptorSet samplerTexture(String name, int binding, ITexture texture) {
-        bindings.put(name, new ResourceBinding(ResourceType.SAMPLER_TEXTURE, binding, texture, null, 0L, 0L));
+        bindings.put(name, new ResourceBinding(ResourceType.SAMPLER_TEXTURE, resolveSetIndex(name), binding, texture, null, 0L, 0L));
         dirty = true;
         return this;
     }
 
     public PipelineDescriptorSet samplerTexture(String name, int binding, ITexture texture, ISampler sampler) {
-        bindings.put(name, new ResourceBinding(ResourceType.SAMPLER_TEXTURE, binding, texture, sampler, 0L, 0L));
+        bindings.put(name, new ResourceBinding(ResourceType.SAMPLER_TEXTURE, resolveSetIndex(name), binding, texture, sampler, 0L, 0L));
         dirty = true;
         return this;
     }
 
     public PipelineDescriptorSet storageImage(String name, int binding, ITexture texture) {
-        bindings.put(name, new ResourceBinding(ResourceType.STORAGE_IMAGE, binding, texture, null, 0L, 0L));
+        bindings.put(name, new ResourceBinding(ResourceType.STORAGE_IMAGE, resolveSetIndex(name), binding, texture, null, 0L, 0L));
         dirty = true;
         return this;
+    }
+
+    /// 从 shader 资源布局解析该名字所属的 Vulkan set 号；未声明则回落 0。
+    private int resolveSetIndex(String name) {
+        var resourcesLayout = shader.getDescription().resourcesLayout();
+        if (!resourcesLayout.hasResource(name)) {
+            return 0;
+        }
+        return resourcesLayout.getResource(name).set();
     }
 
     private int getBinding(String name) {
@@ -149,6 +178,7 @@ public abstract class PipelineDescriptorSet {
 
     public enum ResourceType {
         UNIFORM_BUFFER,
+        STORAGE_BUFFER,
         SAMPLER_TEXTURE,
         STORAGE_IMAGE
     }
@@ -160,13 +190,20 @@ public abstract class PipelineDescriptorSet {
         final ISampler sampler;
         final long offset;
         final long range;
+        /// Vulkan 描述符集合索引（GL 忽略）。默认 0。
+        final int setIndex;
 
         ResourceBinding(ResourceType type, int bindingPoint, GpuObject resource, ISampler sampler, long offset, long range) {
+            this(type, 0, bindingPoint, resource, sampler, offset, range);
+        }
+
+        ResourceBinding(ResourceType type, int setIndex, int bindingPoint, GpuObject resource, ISampler sampler, long offset, long range) {
             this.type = type;
             if (resource == null) {
                 throw new NullPointerException("Resource is null");
             }
             this.resource = resource;
+            this.setIndex = setIndex;
             this.bindingPoint = bindingPoint;
             this.sampler = sampler;
             this.offset = offset;
@@ -183,6 +220,10 @@ public abstract class PipelineDescriptorSet {
 
         public int bindingPoint() {
             return bindingPoint;
+        }
+
+        public int setIndex() {
+            return setIndex;
         }
 
         public ISampler sampler() {

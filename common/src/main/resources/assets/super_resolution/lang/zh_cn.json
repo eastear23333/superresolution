@@ -23,6 +23,10 @@
     "superresolution.algo.preset.xess.ultra_performance": "超级性能",
     "superresolution.algo.preset.xess.ultra_quality": "超高质量",
     "superresolution.algo.preset.xess.ultra_quality_plus": "超高质量+",
+    "superresolution.algo.preset.nss.performance": "性能",
+    "superresolution.algo.preset.nss.balanced": "平衡",
+    "superresolution.algo.preset.nss.quality": "质量",
+    "superresolution.algo.nss.briefName": "Arm NSS",
     "superresolution.capture_mode.a": "模式A",
     "superresolution.capture_mode.b": "模式B",
     "superresolution.capture_mode.c": "模式C",
@@ -264,6 +268,12 @@
     "superresolution.screen.config.special.fsr2.fp16.tooltip": "启用后可以提升性能，但会略微损失画质。",
     "superresolution.screen.config.special.fsr2.version.name": "版本",
     "superresolution.screen.config.special.fsr2.version.tooltip": "FSR2 的版本，不同版本间存在一些区别。\n默认为 2.3.3。",
+    "superresolution.screen.config.special.nss.model.name": "Arm NSS 模型",
+    "superresolution.screen.config.special.nss.model.tooltip": "选择 Arm NSS 的模型档位。\n\n注意：这只改变模型权重、预处理分辨率与 KPN 通道数，**不影响超分比例** —— NSS v1_0_1 固定为 2x，三档的输出分辨率都是 2x。\n\nHIGH：全分辨率预处理，KPN 36 通道\nMID：半分辨率预处理 + 去遮挡掩码，KPN 16 通道，历史用 Catmull-Rom\nLOW：同 MID 的权重与分辨率，历史不做 Catmull-Rom（更省）",
+    "superresolution.screen.config.special.nss.model.tooltip.unimplemented": "该档位尚未接入：还差 0_disocclusion_mask_lq pass（它的 shared header 仍停在 push_constant）与 pre/post 的 INPUT_LAYOUT=1 定义矩阵。当前请选择 HIGH。",
+    "superresolution.screen.config.special.nss.model.high": "HIGH（全分辨率预处理）",
+    "superresolution.screen.config.special.nss.model.mid": "MID（半分辨率 + 去遮挡）",
+    "superresolution.screen.config.special.nss.model.low": "LOW（半分辨率，无 Catmull）",
     "superresolution.screen.config.special.sgsr2.variant.name": "算法变体",
     "superresolution.screen.config.special.sgsr2.variant.tooltip": "CS_2（计算着色器/2 个后处理通道）：性能适中，效果适中\nCS_3（计算着色器/3 个后处理通道）：性能较差，效果最好",
     "superresolution.screen.info.link.official_website": "官方网站",
@@ -300,5 +310,7 @@
     "superresolution.screen.config.hint.shader_compat_warning.text.compat": "当前光影尚未适配超分辨率模组，将以兼容模式运行。此模式下可能出现画面模糊、重影鬼影、性能下降、与其他模组兼容性降低等问题。",
     "superresolution.screen.config.hint.shader_compat_warning.text.disabled": "当前光影尚未适配超分辨率模组，超分辨率已停用。开启「启用未适配光影兼容模式」并重启游戏后，将以兼容模式运行，但可能出现画面模糊、重影鬼影、性能下降、与其他模组兼容性降低等问题。",
     "superresolution.screen.config.hint.frame_generation_only_warning.title": "仅启用帧生成模式",
-    "superresolution.screen.config.hint.frame_generation_only_warning.text": "此光影使用仅帧生成模式，超分辨率功能已禁用"
+    "superresolution.screen.config.hint.frame_generation_only_warning.text": "此光影使用仅帧生成模式，超分辨率功能已禁用",
+    "superresolution.algo.preset.nss.ultra_quality": "极致质量",
+    "superresolution.algo.preset.nss.ultra_performance": "极致性能"
 }

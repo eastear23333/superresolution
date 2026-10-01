@@ -33,6 +33,7 @@ public class SpecialConfigs {
     public DLSSRRSpecialConfig DLSSRR;
     public SGSR2SpecialConfig SGSR2;
     public SGSR1SpecialConfig SGSR1;
+    public NSSSpecialConfig NSS;
 
     public transient Map<String, Pair<SpecialConfig, String>> description = new HashMap<>();
 
@@ -45,6 +46,7 @@ public class SpecialConfigs {
         DLSSRR = new DLSSRRSpecialConfig(builder);
         SGSR2 = new SGSR2SpecialConfig(builder);
         SGSR1 = new SGSR1SpecialConfig(builder);
+        NSS = new NSSSpecialConfig(builder);
         description.put("fsr1", Pair.of(FSR1, AlgorithmDescriptions.FSR1.getDisplayName()));
         description.put("fsr2", Pair.of(FSR2, AlgorithmDescriptions.FSR2.getDisplayName()));
         description.put("fsr", Pair.of(FSR, AlgorithmDescriptions.FSR.getDisplayName()));
@@ -52,5 +54,6 @@ public class SpecialConfigs {
         description.put("dlssrr", Pair.of(DLSSRR, AlgorithmDescriptions.DLSSRR.getDisplayName()));
         description.put("sgsr2", Pair.of(SGSR2, AlgorithmDescriptions.SGSR2.getDisplayName()));
         description.put("sgsr1", Pair.of(SGSR1, AlgorithmDescriptions.SGSR1.getDisplayName()));
+        description.put("nss", Pair.of(NSS, AlgorithmDescriptions.NSS.getDisplayName()));
     }
 }

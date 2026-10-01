@@ -37,6 +37,8 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 import static org.lwjgl.vulkan.KHRDynamicRendering.*;
@@ -124,6 +126,7 @@ public class VulkanCommandDecoder implements ICommandDecoder {
             case StaticDraw, DynamicDraw -> VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
             case Ubo ->
                     VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            case Storage -> VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             case TransferSrc, TransferDst -> VK_PIPELINE_STAGE_TRANSFER_BIT;
         };
     }
@@ -140,6 +143,7 @@ public class VulkanCommandDecoder implements ICommandDecoder {
         return switch (usage) {
             case StaticDraw, DynamicDraw -> VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
             case Ubo -> VK_ACCESS_UNIFORM_READ_BIT;
+            case Storage -> VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             case TransferSrc -> VK_ACCESS_TRANSFER_READ_BIT;
             case TransferDst -> VK_ACCESS_TRANSFER_WRITE_BIT;
         };
@@ -219,11 +223,27 @@ public class VulkanCommandDecoder implements ICommandDecoder {
     @Override
     public void clearTextureRGBA(ICommandBuffer commandBuffer, ITexture texture, float[] color) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            /*
+             * ★★ 不要假设 color 一定有 4 个分量！★★
+             *
+             * ValidatedCommandDecoder.clearTextureRGBA 的校验是
+             *     color.length == format.getChannelCount()
+             * 而 getChannelCount() 对非 RGBA 格式会返回 < 4：
+             *     R8           → 1
+             *     R11G11B10F   → 3   （只声明 R/G/B，无 A）
+             *     RGBA8_SNORM  → 4
+             * 原实现硬访问 color[0..3]，于是 R8 会 `Index 1 out of bounds for length 1`、
+             * R11G11B10F 会在 color[3] 越界。两者都是**通过校验后才在解码器里炸**，
+             * 属于两层契约不一致。
+             *
+             * 修复：缺失的分量按 0 补齐（对 clear 语义而言 0 就是期望值）。
+             * 这样上层只需按格式给足分量数，不必关心 VkClearColorValue 固定 4 槽。
+             */
             VkClearColorValue clearColor = VkClearColorValue.calloc(stack);
-            clearColor.float32(0, color[0]);
-            clearColor.float32(1, color[1]);
-            clearColor.float32(2, color[2]);
-            clearColor.float32(3, color[3]);
+            clearColor.float32(0, color.length > 0 ? color[0] : 0.0f);
+            clearColor.float32(1, color.length > 1 ? color[1] : 0.0f);
+            clearColor.float32(2, color.length > 2 ? color[2] : 0.0f);
+            clearColor.float32(3, color.length > 3 ? color[3] : 0.0f);
             VulkanTexture vulkanTexture = (VulkanTexture) texture;
             long imageHandle = vulkanTexture.handle();
             VulkanCommandBuffer vulkanCommandBuffer = (VulkanCommandBuffer) commandBuffer;
@@ -601,6 +621,10 @@ public class VulkanCommandDecoder implements ICommandDecoder {
         if (colorAttachment != null) {
             transitionTexture(cmd, colorAttachment, ResourceAccessType.COLOR_ATTACHMENT_WRITE);
         }
+        // MRT：额外颜色附件同样需要转入 COLOR_ATTACHMENT_WRITE
+        for (ITexture extra : vkFramebuffer.getExtraColorAttachmentTextures()) {
+            transitionTexture(cmd, extra, ResourceAccessType.COLOR_ATTACHMENT_WRITE);
+        }
 
         ITexture depthAttachment = vkFramebuffer.getDepthAttachmentTexture();
         if (depthAttachment != null) {
@@ -614,30 +638,45 @@ public class VulkanCommandDecoder implements ICommandDecoder {
             renderingInfo.renderArea().offset().set(0, 0);
             renderingInfo.renderArea().extent().set(vkFramebuffer.getWidth(), vkFramebuffer.getHeight());
 
-            VkRenderingAttachmentInfoKHR.Buffer colorAttachmentInfo = null;
+            List<ITexture> allColorTextures = new ArrayList<>();
             if (colorAttachment != null) {
-                long colorImageView = vkFramebuffer.resolveColorImageView();
-                int loadOp = renderPass.clearState().shouldClearColorOnBegin(0)
-                        ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+                allColorTextures.add(colorAttachment);
+            }
+            allColorTextures.addAll(vkFramebuffer.getExtraColorAttachmentTextures());
 
-                colorAttachmentInfo = VkRenderingAttachmentInfoKHR.calloc(1, stack)
-                        .sType(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR)
-                        .imageView(colorImageView)
-                        .imageLayout(colorAttachment instanceof VulkanExternalTexture
-                                ? ((VulkanExternalTexture) colorAttachment).getCurrentLayout()
-                                : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                        .loadOp(loadOp)
-                        .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+            if (!allColorTextures.isEmpty()) {
+                VkRenderingAttachmentInfoKHR.Buffer colorAttachmentInfo =
+                        VkRenderingAttachmentInfoKHR.calloc(allColorTextures.size(), stack);
 
-                if (loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
-                    float[] cc = renderPass.clearState().getColorClearValueOnBegin(0);
-                    colorAttachmentInfo.clearValue().color().float32(0, cc[0]).float32(1, cc[1]).float32(2, cc[2]).float32(3, cc[3]);
+                for (int i = 0; i < allColorTextures.size(); i++) {
+                    ITexture tex = allColorTextures.get(i);
+                    long imageView;
+                    if (i == 0) {
+                        imageView = vkFramebuffer.resolveColorImageView();
+                    } else {
+                        // MRT 附件视图：索引 i-1 对应额外附件列表
+                        imageView = vkFramebuffer.resolveExtraColorImageViews().get(i - 1);
+                    }
+                    int loadOp = renderPass.clearState().shouldClearColorOnBegin(i)
+                            ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+
+                    colorAttachmentInfo.get(i)
+                            .sType(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR)
+                            .imageView(imageView)
+                            .imageLayout(tex instanceof VulkanExternalTexture
+                                    ? ((VulkanExternalTexture) tex).getCurrentLayout()
+                                    : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                            .loadOp(loadOp)
+                            .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+
+                    if (loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                        float[] cc = renderPass.clearState().getColorClearValueOnBegin(i);
+                        colorAttachmentInfo.get(i).clearValue().color()
+                                .float32(0, cc[0]).float32(1, cc[1]).float32(2, cc[2]).float32(3, cc[3]);
+                    }
                 }
 
                 renderingInfo.pColorAttachments(colorAttachmentInfo);
-                //renderingInfo.colorAttachmentCount(1);
-            } else {
-                //renderingInfo.colorAttachmentCount(0);
             }
 
             VkRenderingAttachmentInfoKHR depthAttachmentInfo = null;
@@ -708,6 +747,44 @@ public class VulkanCommandDecoder implements ICommandDecoder {
         vcb._endRenderPass();
     }
 
+    /**
+     * 在 <b>render pass 之前</b>把图形管线要采样/读写的纹理转到目标布局。
+     *
+     * <p>{@link #bindPipeline(ICommandBuffer, GraphicsPipeline)} 里也会做同样的事，
+     * 但那时已经在 render pass 内部，而
+     * {@code vkCmdPipelineBarrier} 在 render pass 实例里<b>不允许做布局转换</b>
+     * （{@code VUID-vkCmdPipelineBarrier-oldLayout-01181}），且 stage mask 被限制在
+     * framebuffer-space 阶段、必须带 {@code VK_DEPENDENCY_BY_REGION_BIT}
+     * （{@code 09556} / {@code 07891}）。驱动对这类非法 barrier 的处理是未定义的 ——
+     * 实测会让时序型算法（NSS/XeSS/FSR 这类读写历史纹理的）读到尚未可见的上一帧结果，
+     * 表现为画面抖动/闪烁。
+     *
+     * <p>{@link #transitionTexture} 是幂等的：目标状态一致时不会发 barrier。
+     * 所以先在这里转好，{@code bindPipeline} 里的那次就变成空操作，不再产生非法 barrier。
+     */
+    public void prepareGraphicsPipelineResources(ICommandBuffer commandBuffer, GraphicsPipeline pipeline) {
+        if (!(commandBuffer instanceof VulkanCommandBuffer vcb)) {
+            throw new IllegalArgumentException("prepareGraphicsPipelineResources: invalid commandBuffer type: "
+                    + commandBuffer.getClass().getName());
+        }
+        if (vcb.isRenderPassActive()) {
+            throw new IllegalStateException(
+                    "prepareGraphicsPipelineResources: must be called outside a render pass; call it before beginRenderPass");
+        }
+        if (pipeline == null) {
+            throw new IllegalArgumentException("prepareGraphicsPipelineResources: pipeline must not be null");
+        }
+        if (!(pipeline instanceof VulkanGraphicsPipeline vkGraphicsPipeline)) {
+            throw new IllegalArgumentException("prepareGraphicsPipelineResources: invalid pipeline type: "
+                    + pipeline.getClass().getName());
+        }
+
+        VkCommandBuffer cmd = vcb.getNativeCommandBuffer();
+        vkGraphicsPipeline.ensurePipelineCreated();
+        VulkanPipelineDescriptorSet vkDescriptorSet = (VulkanPipelineDescriptorSet) pipeline.descriptorSet();
+        prepareDescriptorResources(cmd, vkDescriptorSet, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    }
+
     @Override
     public void bindPipeline(ICommandBuffer commandBuffer, GraphicsPipeline pipeline) {
         if (!(commandBuffer instanceof VulkanCommandBuffer vcb)) {
@@ -733,6 +810,11 @@ public class VulkanCommandDecoder implements ICommandDecoder {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineHandle);
                 vcb.recordNativePipelineBind(VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineHandle);
             }
+            // 采样纹理的布局转换：与 compute 路径对称。否则上一帧作为颜色附件写过的纹理
+            // （或 compute 以 storage image 写过的纹理）会以旧布局被采样，
+            // 而描述符里声明的是 SHADER_READ_ONLY_OPTIMAL —— 布局不匹配。
+            // 转换只涉及非当前附件的图像，在 render pass 内做是合法的。
+            prepareDescriptorResources(cmd, vkDescriptorSet, VK_PIPELINE_BIND_POINT_GRAPHICS);
             vkDescriptorSet.pushDescriptorsIfNeeded(vcb, cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkGraphicsPipeline.getPipelineLayout());
             pipeline.applyDynamicStates(commandBuffer);
             vcb.bindGraphicsPipeline(vkGraphicsPipeline);

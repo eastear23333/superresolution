@@ -1,0 +1,42 @@
+//
+// NSS 时序反馈：int8 张量 → SNORM 纹理
+//
+// Arm 原版把数据图的时序输出张量（int8 NHWC [H][W][4]）与一张
+// R8G8B8A8_SNORM 纹理做 memory alias（scenario 里的 memory_group
+// `out_temporal` / `out_tp`），因为数据图的输出可以按 LINEAR tiling 落盘。
+//
+// SR 框架下 nss_dp4a 只能往宿主提供的 VkBuffer 里写，没有 buffer/image 别名
+// 通道，所以用一个 convert pass 把 int8 拷贝成 SNORM 纹理 —— 数值完全等价：
+// 采样 SNORM 得到 v/127，与直接读 int8 再 /127 一致。
+//
+
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// nss_dp4a 的时序反馈输出：int8 NHWC [H][W][4]
+layout(set = 0, binding = 0, std430) readonly buffer TemporalTensor {
+    int8_t data[];
+} _TemporalTensor;
+
+// 目标：R8G8B8A8_SNORM，供前处理以 sampler2D + LINEAR 采样
+layout(set = 0, binding = 1, rgba8_snorm) writeonly uniform image2D _TemporalImage;
+
+void main() {
+    ivec2 size = imageSize(_TemporalImage);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+    int base = (pixel.y * size.x + pixel.x) * 4;
+    vec4 value = vec4(
+        float(_TemporalTensor.data[base + 0]),
+        float(_TemporalTensor.data[base + 1]),
+        float(_TemporalTensor.data[base + 2]),
+        float(_TemporalTensor.data[base + 3])
+    );
+    imageStore(_TemporalImage, pixel, value / 127.0);
+}

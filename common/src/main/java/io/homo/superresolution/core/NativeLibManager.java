@@ -62,6 +62,9 @@ public class NativeLibManager {
     public static NativeLib LIB_SUPER_RESOLUTION_FSR4 = null;
     public static NativeLib LIB_SUPER_RESOLUTION_XESS = null;
     public static NativeLib LIB_SUPER_RESOLUTION_NGX = null;
+    public static NativeLib LIB_SUPER_RESOLUTION_NSS = null;
+    /** NSS 的 DP4A 推理后端（{@code nss_dp4a.dll}）。 */
+    public static NativeLib LIB_SUPER_RESOLUTION_NSS_DP4A = null;
     public static NativeLib LIB_SUPER_RESOLUTION_STREAMLINE = null;
     public static NativeLib LIB_NGX_DLSSG_SNIPPET = null;
     private static boolean nativeApiAvailable;
@@ -105,6 +108,22 @@ public class NativeLibManager {
                     false,
                     false
             );
+            LIB_SUPER_RESOLUTION_NSS = new NativeLib(
+                    "SuperResolutionNSS",
+                    false,
+                    false
+            );
+            // NSS 的 DP4A 推理后端。文件名不带版本/平台后缀（由 NssDp4a 侧自行约定），
+            // 因此用 nameIsPath=true 走字面名；NSS.java 会从 libraries 目录按
+            // "nss_dp4a.dll" 拼出 NSS_DP4A_DLL_PATH 传给 SR_NSS_LIB 加载。
+            LIB_SUPER_RESOLUTION_NSS_DP4A = new NativeLib(
+                    "nss_dp4a",
+                    false,
+                    // 必选：没它就建不出 DP4A 上下文，NSS 完全不可用。
+                    // 但只在 Windows 上注册（本分支即为 Windows），其他平台 NSS 本就不可用。
+                    true,
+                    true
+            );
             LIB_SUPER_RESOLUTION_STREAMLINE = new NativeLib(
                     "SuperResolutionStreamline",
                     shouldLoad,
@@ -117,6 +136,8 @@ public class NativeLibManager {
             libs.add(LIB_SUPER_RESOLUTION_FSR4);
             libs.add(LIB_SUPER_RESOLUTION_XESS);
             libs.add(LIB_SUPER_RESOLUTION_NGX);
+            libs.add(LIB_SUPER_RESOLUTION_NSS);
+            libs.add(LIB_SUPER_RESOLUTION_NSS_DP4A);
             libs.add(LIB_SUPER_RESOLUTION_STREAMLINE);
         } else if (operatingSystem.type == OperatingSystemType.ANDROID && operatingSystem.arch == SystemArchitecture.AARCH64) {
             LIB_SUPER_RESOLUTION = new NativeLib("SuperResolution", true, true);

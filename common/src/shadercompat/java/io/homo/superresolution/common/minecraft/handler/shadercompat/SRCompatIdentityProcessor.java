@@ -49,7 +49,9 @@ public class SRCompatIdentityProcessor implements SRCompatProcessor {
 
     @Override
     public Vector2f adaptJitterForShaderpack(Vector2f rawJitter, AbstractAlgorithm algorithm, SRShaderCompatData config, AlgorithmDescription<?> description) {
-        return rawJitter;
+        // 补偿光影 texelSize 用物理屏幕尺寸导致的幅度偏差
+        // （详见 ShaderpackJitterCompensation 的说明）。
+        return ShaderpackJitterCompensation.compensate(rawJitter);
     }
 
     @Override

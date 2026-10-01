@@ -302,5 +302,9 @@
     "superresolution.screen.config.hint.shader_compat_warning.text.compat": "現在のシェーダーパックはSuper Resolution MODに対応していないため、互換モードで動作します。このモードでは、画面のぼやけ、ゴーストの発生、パフォーマンス低下、他のMODとの互換性低下などの問題が発生する可能性があります。",
     "superresolution.screen.config.hint.shader_compat_warning.text.disabled": "現在のシェーダーパックはSuper Resolution MODに対応していないため、スーパーレゾリューションは無効になっています。「未対応シェーダーの互換モードを有効化」を有効にしてゲームを再起動すると、互換モードで動作しますが、画面のぼやけ、ゴーストの発生、パフォーマンス低下、他のMODとの互換性低下などの問題が発生する可能性があります。",
     "superresolution.screen.config.hint.frame_generation_only_warning.title": "フレーム生成のみモード",
-    "superresolution.screen.config.hint.frame_generation_only_warning.text": "このシェーダーパックはフレーム生成のみモードを使用しています。超解像度機能は無効です"
+    "superresolution.screen.config.hint.frame_generation_only_warning.text": "このシェーダーパックはフレーム生成のみモードを使用しています。超解像度機能は無効です",
+    "superresolution.algo.preset.nss.ultra_quality": "ウルトラ品質",
+    "superresolution.algo.preset.nss.quality": "品質",
+    "superresolution.algo.preset.nss.performance": "パフォーマンス",
+    "superresolution.algo.preset.nss.ultra_performance": "ウルトラパフォーマンス"
 }

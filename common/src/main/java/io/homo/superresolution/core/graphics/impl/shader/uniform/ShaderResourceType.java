@@ -20,6 +20,9 @@ package io.homo.superresolution.core.graphics.impl.shader.uniform;
 
 public enum ShaderResourceType {
     UniformBuffer,
+    /// Shader storage buffer（SSBO）。GL: glBindBufferBase(GL_SHADER_STORAGE_BUFFER)；
+    /// Vulkan: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER。NSS 的 12ch int8 张量与 KPN 参数用它。
+    StorageBuffer,
     SamplerTexture,
     StorageTexture
 }

@@ -61,7 +61,7 @@ public class VulkanComputePipeline extends ComputePipeline {
         try (MemoryStack stack = stackPush()) {
             VkPipelineLayoutCreateInfo layoutInfo = VkPipelineLayoutCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
-                    .pSetLayouts(stack.longs(descriptorSet.getDescriptorSetLayout()));
+                    .pSetLayouts(stack.longs(descriptorSet.getDescriptorSetLayouts()));
 
             LongBuffer pLayout = stack.mallocLong(1);
             VK_CHECK(vkCreatePipelineLayout(device.getVkDevice(), layoutInfo, null, pLayout),

@@ -155,6 +155,13 @@ public class AlgorithmManager {
     }
 
     public static Vector2f getJitterOffset() {
+        // 稳定模式（2026-09-27）：KPN 输入链修复前禁用 jitter —— 本函数是
+        // 光影 SRJitterOffset 与 NSS _JitterOffset 的共同源头，返回 0 即全链生效。
+        // 实测：jitter=0 时静止画面完全稳定；jitter 存在（任意符号）则输出微抖，
+        // 与 NSS 内部处理方式无关（详见 config 注释与当日工作记忆）。
+        if (SuperResolutionConfig.isNssDisableJitter()) {
+            return new Vector2f(0);
+        }
         if (supportsJitter(SuperResolution.algorithmDescription)) {
             return Fsr2Utils.ffxFsr2GetJitterOffset(
                     GameFrameIndex.current(),

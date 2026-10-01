@@ -186,7 +186,7 @@ public class VulkanGraphicsPipeline extends GraphicsPipeline {
         try (MemoryStack stack = stackPush()) {
             VkPipelineLayoutCreateInfo layoutInfo = VkPipelineLayoutCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
-                    .pSetLayouts(stack.longs(descriptorSet.getDescriptorSetLayout()));
+                    .pSetLayouts(stack.longs(descriptorSet.getDescriptorSetLayouts()));
 
             LongBuffer pLayout = stack.mallocLong(1);
             VK_CHECK(vkCreatePipelineLayout(device.getVkDevice(), layoutInfo, null, pLayout),
@@ -362,13 +362,16 @@ public class VulkanGraphicsPipeline extends GraphicsPipeline {
 
             // Build VkPipelineRenderingCreateInfo for dynamic rendering
             VulkanFramebuffer vkFb = (VulkanFramebuffer) renderPass().frameBuffer();
-            int colorAttachmentCount = vkFb.getColorAttachmentTexture() != null ? 1 : 0;
+            List<Integer> colorFormats = vkFb.resolveAllColorFormats();
+            int colorAttachmentCount = colorFormats.size();
             boolean hasDepth = vkFb.getDepthAttachmentTexture() != null;
 
             IntBuffer pColorFormats = null;
             if (colorAttachmentCount > 0) {
-                pColorFormats = stack.mallocInt(1);
-                pColorFormats.put(0, vkFb.getColorAttachmentTexture().getTextureFormat().vk());
+                pColorFormats = stack.mallocInt(colorAttachmentCount);
+                for (int i = 0; i < colorAttachmentCount; i++) {
+                    pColorFormats.put(i, colorFormats.get(i));
+                }
             }
             int depthFormat = hasDepth ? vkFb.getDepthAttachmentTexture().getTextureFormat().vk() : VK_FORMAT_UNDEFINED;
             int stencilFormat = VK_FORMAT_UNDEFINED;

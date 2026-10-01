@@ -23,6 +23,10 @@
     "superresolution.algo.preset.xess.ultra_performance": "Ultra Performance",
     "superresolution.algo.preset.xess.ultra_quality": "Ultra Quality",
     "superresolution.algo.preset.xess.ultra_quality_plus": "Ultra Quality+",
+    "superresolution.algo.preset.nss.performance": "Performance",
+    "superresolution.algo.preset.nss.balanced": "Balanced",
+    "superresolution.algo.preset.nss.quality": "Quality",
+    "superresolution.algo.nss.briefName": "Arm NSS",
     "superresolution.capture_mode.a": "Mode A",
     "superresolution.capture_mode.b": "Mode B",
     "superresolution.capture_mode.c": "Mode C",
@@ -264,6 +268,12 @@
     "superresolution.screen.config.special.fsr2.fp16.tooltip": "Enabling may improve performance but will slightly reduce image quality",
     "superresolution.screen.config.special.fsr2.version.name": "Version",
     "superresolution.screen.config.special.fsr2.version.tooltip": "FSR2 version, there are some differences between versions.\nDefault is 2.3.3",
+    "superresolution.screen.config.special.nss.model.name": "Arm NSS Model",
+    "superresolution.screen.config.special.nss.model.tooltip": "Select the Arm NSS model tier.\n\nNote: this only changes the model weights, the preprocess resolution and the KPN channel count. It does **not** change the upscale ratio — NSS v1_0_1 is locked to 2x, and all three tiers output at 2x.\n\nHIGH: full-resolution preprocess, KPN 36 channels\nMID: half-resolution preprocess + disocclusion mask, KPN 16 channels, Catmull-Rom history\nLOW: same weights and resolution as MID, no Catmull-Rom history (cheaper)",
+    "superresolution.screen.config.special.nss.model.tooltip.unimplemented": "This tier is not wired up yet: it still needs the 0_disocclusion_mask_lq pass (whose shared header is still on push_constant) and the INPUT_LAYOUT=1 define matrix for pre/post. Please pick HIGH for now.",
+    "superresolution.screen.config.special.nss.model.high": "HIGH (full-resolution preprocess)",
+    "superresolution.screen.config.special.nss.model.mid": "MID (half-res + disocclusion)",
+    "superresolution.screen.config.special.nss.model.low": "LOW (half-res, no Catmull)",
     "superresolution.screen.config.special.sgsr2.variant.name": "Algorithm Variant",
     "superresolution.screen.config.special.sgsr2.variant.tooltip": "CS_2 (Compute Shader/2 Post-Process Passes): moderate performance, moderate quality\nCS_3 (Compute Shader/3 Post-Process Passes): worse performance, best quality",
     "superresolution.screen.info.link.official_website": "Official Website",
@@ -300,5 +310,7 @@
     "superresolution.screen.config.hint.shader_compat_warning.text.compat": "The current shader pack has not been adapted for Super Resolution and will run in compatibility mode. This mode may cause blurry visuals, ghosting, reduced performance, and decreased compatibility with other mods.",
     "superresolution.screen.config.hint.shader_compat_warning.text.disabled": "The current shader pack has not been adapted for Super Resolution, and super resolution is disabled. After enabling \"Enable Unadapted Shader Compatibility Mode\" and restarting the game, it will run in compatibility mode, which may cause blurry visuals, ghosting, reduced performance, and decreased compatibility with other mods.",
     "superresolution.screen.config.hint.frame_generation_only_warning.title": "Frame Generation Only Mode",
-    "superresolution.screen.config.hint.frame_generation_only_warning.text": "This shader pack uses frame-generation-only mode. Super resolution is disabled."
+    "superresolution.screen.config.hint.frame_generation_only_warning.text": "This shader pack uses frame-generation-only mode. Super resolution is disabled.",
+    "superresolution.algo.preset.nss.ultra_quality": "Ultra Quality",
+    "superresolution.algo.preset.nss.ultra_performance": "Ultra Performance"
 }

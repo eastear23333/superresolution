@@ -42,6 +42,14 @@ tasks.register<Copy>("copyNativeLibAll") {
         duplicatesStrategy = DuplicatesStrategy.INCLUDE
     }
     into("$projectDir/../common/src/main/resources/lib/")
+
+    // NSS 的 DP4A 推理后端：文件名不带平台/版本后缀，且不是 SR 主库的导出，
+    // 所以要单独收进来（放在 lib/ 根下，运行时按 "nss_dp4a.dll" 释放到 libraries/）。
+    from("$projectDir/cpp/output/bin") {
+        include("nss_dp4a.dll")
+        duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
+    into("$projectDir/../common/src/main/resources/lib/")
 }
 
 val osName = System.getProperty("os.name").lowercase()

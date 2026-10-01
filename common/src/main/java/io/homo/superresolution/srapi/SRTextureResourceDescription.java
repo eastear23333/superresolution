@@ -60,6 +60,8 @@ public class SRTextureResourceDescription {
             case R8 -> SRSurfaceFormat.R8_UNORM;
             case R32F -> SRSurfaceFormat.R32_FLOAT;
             case R32UI -> SRSurfaceFormat.R32_UINT;
+            // 动态 offset LUT 用格式；不属于 SR API 的对外表面格式集合。
+            case RGBA32UI -> SRSurfaceFormat.UNKNOWN;
             case DEPTH32 -> SRSurfaceFormat.R32_TYPELESS;
             case DEPTH32F -> SRSurfaceFormat.D32_SFLOAT;
             case DEPTH24_STENCIL8, DEPTH24, DEPTH_COMPONENT, DEPTH32F_STENCIL8 -> SRSurfaceFormat.UNKNOWN;
@@ -67,6 +69,7 @@ public class SRTextureResourceDescription {
             case R11G11B10F -> SRSurfaceFormat.R11G11B10_FLOAT;
             case RGBA16 -> SRSurfaceFormat.R16G16B16A16_TYPELESS;
             case RGBA16_SNORM -> SRSurfaceFormat.R16G16B16A16_SNORM;
+            case RGBA8_SNORM -> SRSurfaceFormat.R8G8B8A8_SNORM;
             case RGBA32F -> SRSurfaceFormat.R32G32B32A32_FLOAT;
         };
 

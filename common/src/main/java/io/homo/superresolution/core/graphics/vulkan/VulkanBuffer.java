@@ -66,6 +66,7 @@ public class VulkanBuffer implements IBuffer {
     private static int translateUsage(BufferUsage usage) {
         return switch (usage) {
             case Ubo -> VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+            case Storage -> VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
             case StaticDraw, DynamicDraw ->
                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
             case TransferSrc -> VK_BUFFER_USAGE_TRANSFER_SRC_BIT;

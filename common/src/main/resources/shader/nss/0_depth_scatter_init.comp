@@ -1,0 +1,51 @@
+//
+// -----------------------------------------------------------------------------
+// The proprietary software and information contained in this file is
+// confidential and may only be used by an authorized person under a valid
+// licensing agreement from Arm Limited or its affiliates.
+//
+// Copyright (C) 2026 Arm Limited or its affiliates. All rights reserved.
+//
+// This entire notice must be reproduced on all copies of this file and
+// copies of this file may only be made by an authorized person under a valid
+// licensing agreement from Arm Limited or its affiliates.
+// -----------------------------------------------------------------------------
+//
+
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "typedefs.h"
+
+layout(set=0, binding=0, r32ui) uniform uimage2D _OutDepth; // 540p->1080p HQ: 480x270 | R32_UINT 32bpp | depth-scatter clear target | 0.494 MiB ; Low/Mid: 240x135 | 0.124 MiB
+
+// 移植说明（SR 框架）：由 NSS_USE_UBO 切到 std140 uniform block。
+#ifdef NSS_USE_UBO
+// 全部资源必须落在 set=0：SR 框架的 Vulkan 后端只支持 push descriptor，
+// 而 VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293 禁止一个管线布局里
+// 出现两个 push descriptor set —— 用两个 set 会让 set 0 永远无法绑定。
+layout(std140, set = 0, binding = 1) uniform PushConstants {
+#else
+layout(push_constant, std430) uniform PushConstants {
+#endif
+    // ─────────────── 16-byte ABI prefix reused from depth scatter ───────────────
+    // Offsets [0, 15] belong to the full depth-scatter push-constant blob and
+    // are intentionally ignored by this clear pass.
+
+    // ───────────────  8-byte aligned ───────────────
+    // Previous-depth output dimensions used for the clear-pass dispatch guard.
+    layout(offset = 16) int32_t2 _OutputDims; //   8 B
+                                              // Total accessed range: **24 bytes** (shared ABI blob is 48 bytes)
+};
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main()
+{
+    int32_t2 pixel = int32_t2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, _OutputDims))) {
+        return;
+    }
+    imageStore(_OutDepth, pixel, uvec4(uint(0x7fffffff), 0u, 0u, 0u));
+}

@@ -25,6 +25,7 @@ import io.homo.superresolution.api.InputResourceType;
 import io.homo.superresolution.api.interop.*;
 import io.homo.superresolution.common.config.SuperResolutionConfig;
 import io.homo.superresolution.common.framegeneration.FrameGeneration;
+import io.homo.superresolution.common.SuperResolution;
 import io.homo.superresolution.common.minecraft.handler.RenderHandlerManager;
 import io.homo.superresolution.common.perf.PerformanceTracker;
 import io.homo.superresolution.common.presentation.PresentationBackendManager;
@@ -272,11 +273,36 @@ public abstract class GlVulkanInteropAlgorithm extends AbstractAlgorithm impleme
         VulkanCommandBuffer commandBuffer = commandBufferRing.acquire(vulkanDevice);
         // 构建第N-1帧的Cmdbuf
 
+        /*
+         * ★★ begin/end 必须成对，异常路径要兜底 ★★
+         *
+         * 原来写成 begin → dispatchVulkanUpscale → end 的裸序列。一旦
+         * dispatchVulkanUpscale 内部抛异常（例如资源越界、校验层拒绝），
+         * end() 与 submitCommandBuffer() 都会被跳过：
+         *   1) 命令缓冲停在「已 begin 未 end」的非法状态，被放回 ring；
+         *   2) 下一帧 acquire 到同一个缓冲（cursor 先取后递增会绕回来），
+         *      于是那一帧的 upscale 命令整体缺失 → **输出退回未超分画面**；
+         *   3) 两帧状态互相污染，表现为「一会超分、一会不超分」的周期性交替。
+         *
+         * 这里显式捕获异常：记录一次、复位命令缓冲、返回 false（本帧不超分，
+         * 但**不破坏** ring 与后续帧），避免小问题被放大成逐帧交替。
+         */
         commandBuffer.begin();
-        dispatchVulkanUpscale(
-                commandBuffer,
-                frameResourcesSet
-        );
+        try {
+            dispatchVulkanUpscale(
+                    commandBuffer,
+                    frameResourcesSet
+            );
+        } catch (Throwable t) {
+            SuperResolution.LOGGER.error(
+                    "NSS/interop 超分录制阶段抛出异常，已放弃本帧提交以避免命令缓冲状态错乱", t);
+            try {
+                commandBuffer.end();
+            } catch (Throwable ignored) {
+                // end() 自身也可能失败（例如从未真正进入 recording），无妨
+            }
+            return false;
+        }
         commandBuffer.end();
 
         // 提交第N-1帧的Cmdbuf

@@ -22,6 +22,9 @@ public class ShaderResourceDescription {
     private final String name;
     private final ShaderResourceType type;
     private int binding = -1;
+    /// Vulkan 描述符集合索引。GL 后端忽略此字段（GL 无 set 概念）。
+    /// NSS 等移植自 Vulkan 的 shader 把采样器放 set=0、SSBO 放 set=1。
+    private int set = 0;
     private int bufferSize = -1;
     private ShaderResourceAccess access = ShaderResourceAccess.Both;
 
@@ -29,6 +32,7 @@ public class ShaderResourceDescription {
         this.name = builder.name;
         this.type = builder.type;
         this.binding = builder.binding;
+        this.set = builder.set;
         this.bufferSize = builder.bufferSize;
         this.access = builder.access;
     }
@@ -53,6 +57,10 @@ public class ShaderResourceDescription {
         return binding;
     }
 
+    public int set() {
+        return set;
+    }
+
     public int bufferSize() {
         return bufferSize;
     }
@@ -61,6 +69,7 @@ public class ShaderResourceDescription {
         private final String name;
         private final ShaderResourceType type;
         private int binding = -1;
+        private int set = 0;
         private int bufferSize = -1;
         private ShaderResourceAccess access = ShaderResourceAccess.Both;
 
@@ -76,6 +85,15 @@ public class ShaderResourceDescription {
 
         public Builder binding(int binding) {
             this.binding = binding;
+            return this;
+        }
+
+        /// Vulkan 描述符集合索引（默认 0）。GL 后端会忽略。
+        public Builder set(int set) {
+            if (set < 0) {
+                throw new IllegalArgumentException("Descriptor set index must be >= 0, got " + set);
+            }
+            this.set = set;
             return this;
         }
 

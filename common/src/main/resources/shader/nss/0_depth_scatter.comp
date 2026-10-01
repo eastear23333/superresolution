@@ -1,0 +1,256 @@
+//
+// -----------------------------------------------------------------------------
+// The proprietary software and information contained in this file is
+// confidential and may only be used by an authorized person under a valid
+// licensing agreement from Arm Limited or its affiliates.
+//
+// Copyright (C) 2026 Arm Limited or its affiliates. All rights reserved.
+//
+// This entire notice must be reproduced on all copies of this file and
+// copies of this file may only be made by an authorized person under a valid
+// licensing agreement from Arm Limited or its affiliates.
+// -----------------------------------------------------------------------------
+//
+
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "typedefs.h"
+// NSS v1 depth scatter shader.
+
+#ifndef NSS_DEPTH_SCATTER_QUARTER_RES_INPUT
+    #define NSS_DEPTH_SCATTER_QUARTER_RES_INPUT 0
+#endif // !NSS_DEPTH_SCATTER_QUARTER_RES_INPUT
+
+//-----------------------------------------------------------------------------
+// Resources
+//-----------------------------------------------------------------------------
+// Inputs are low-resolution frame-space textures.
+// Output stores reconstructed previous-frame depth in uint format so we can
+// use imageAtomics to merge multiple scatter contributions safely.
+layout (set=0, binding=0) uniform mediump sampler2D _MotionTex; // 540p->1080p HQ/Low/Mid: 960x540 | R16G16_SFLOAT 32bpp | 1.978 MiB
+layout (set=0, binding=1) uniform highp   sampler2D _DepthTex;  // 540p->1080p HQ/Low/Mid: 960x540 | R32_SFLOAT 32bpp | 1.978 MiB
+
+// 见 0_depth_scatter_init.comp 的说明：全部资源必须落在 set=0。
+layout (set=0, binding=2, r32ui) uniform uimage2D _OutDepth;    // 540p->1080p HQ: 480x270 | R32_UINT 32bpp | imageAtomicMin target | 0.494 MiB ; Low/Mid: 240x135 | 0.124 MiB
+
+//-----------------------------------------------------------------------------
+// Push constants
+//-----------------------------------------------------------------------------
+// Mirrors the Slang struct layout exactly. `_RenderDims` is present for parity
+// with Slang even though this GLSL path does not consume it directly.
+//
+// 移植说明（SR 框架）：同 1_pre_process_shared.h，由 NSS_USE_UBO 切到
+// std140 uniform block（本块无数组，std140/std430 偏移等价）。
+#ifdef NSS_USE_UBO
+// 全部资源落在 set=0：binding 3（0/1 是采样器，2 是 _OutDepth）。
+layout(std140, set = 0, binding = 3) uniform PushConstants {
+#else
+layout(push_constant, std430) uniform PushConstants {
+#endif
+    // ───────────────  8-byte aligned ───────────────
+    // Source depth/motion extent divided by output depth-scatter extent.
+    layout(offset =  0) float2  _Scale;         //   8 B
+    // Inverse of `_Scale`.
+    layout(offset =  8) float2  _InvScale;      //   8 B
+    // Previous-depth output dimensions.
+    layout(offset = 16) int32_t2 _OutputDims;   //   8 B
+    // Render-resolution dimensions kept for parity with the Slang path.
+    layout(offset = 24) float2  _RenderDims;    //   8 B
+    // Inverse of `_OutputDims`.
+    layout(offset = 32) float2  _InvOutputDims; //   8 B
+
+    // ───────────────  8-byte aligned (SR 移植扩展) ───────────────
+    // 运动矢量纹理单位 → Arm 期望的「forward 渲染分辨率像素」的换算系数。
+    // 见 1_pre_process_shared.h 的同名字段说明（含符号约定）。
+    layout(offset = 40) float2  _MotionToPixels; //   8 B
+                                               // Total: **48 bytes**
+};
+
+struct BilinearSamplingData {
+    int32_t2 iOffsets[4];
+    float fWeights[4];
+    int32_t2 iBasePos;
+};
+
+const float kMotionThreshold = 0.1;
+const float kBilinearWeightThreshold = 0.1;
+const float kDepthIntScale = 2147483647.0;
+// 0 = original 4-tap bilinear scatter, 1 = fast single-tap scatter.
+#define NSS_DEPTH_SCATTER_MODE 0
+
+//-----------------------------------------------------------------------------
+// Helpers
+//-----------------------------------------------------------------------------
+bool IsOnScreen(int32_t2 pos, int32_t2 size)
+{
+    return all(lessThan(pos, size)) && all(greaterThanEqual(pos, int32_t2(0)));
+}
+
+BilinearSamplingData GetBilinearSamplingData(float2 uv, int32_t2 size)
+{
+    BilinearSamplingData data;
+    float2 px = uv * float2(size) - float2(0.5);
+    data.iBasePos = int32_t2(floor(px));
+    float2 frac_px = fract(px);
+
+    data.iOffsets[0] = int32_t2(0, 0);
+    data.iOffsets[1] = int32_t2(1, 0);
+    data.iOffsets[2] = int32_t2(0, 1);
+    data.iOffsets[3] = int32_t2(1, 1);
+
+    data.fWeights[0] = (1.0 - frac_px.x) * (1.0 - frac_px.y);
+    data.fWeights[1] = frac_px.x * (1.0 - frac_px.y);
+    data.fWeights[2] = (1.0 - frac_px.x) * frac_px.y;
+    data.fWeights[3] = frac_px.x * frac_px.y;
+    return data;
+}
+
+void StoreReconstructedDepth(int32_t2 pixel, float depth)
+{
+    // Lower depth wins for normal (non-inverted) depth.
+    // Keep integer encoding consistent with Slang's InterlockedMin path.
+    uint32_t i_depth = uint32_t(clamp(depth, 0.0, 1.0) * kDepthIntScale);
+    imageAtomicMin(_OutDepth, pixel, i_depth);
+}
+
+void ReconstructPrevDepth(float depth, float2 reprojected_uv)
+{
+    int32_t2 out_size = _OutputDims;
+#if (NSS_DEPTH_SCATTER_MODE == 1)
+    // Fast mode: single nearest tap (fewer atomics, lower LS pressure).
+    float2 px = reprojected_uv * float2(out_size) - float2(0.5);
+    int32_t2 base = int32_t2(floor(px));
+    float2 frac_px = fract(px);
+    int32_t2 nearest = base + int32_t2(int32_t(frac_px.x >= 0.5), int32_t(frac_px.y >= 0.5));
+    if (IsOnScreen(nearest, out_size)) {
+        StoreReconstructedDepth(nearest, depth);
+    }
+#else
+    // Scatter one reprojected depth sample into up to 4 bilinear neighbors.
+    // This lets the later depth-clip stage read a denser previous-depth map.
+    BilinearSamplingData bilinear = GetBilinearSamplingData(reprojected_uv, out_size);
+
+    for (int32_t i = 0; i < 4; ++i) {
+        float w = bilinear.fWeights[i];
+        if (w > kBilinearWeightThreshold) {
+            int32_t2 store_pos = bilinear.iBasePos + bilinear.iOffsets[i];
+            if (IsOnScreen(store_pos, out_size)) {
+                StoreReconstructedDepth(store_pos, depth);
+            }
+        }
+    }
+#endif // (NSS_DEPTH_SCATTER_MODE == 1)
+}
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main()
+{
+    //-------------------------------------------------------------------------
+    // 1) Dispatch guard and UV setup
+    //-------------------------------------------------------------------------
+    int32_t2 pixel = int32_t2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, _OutputDims))) {
+        return;
+    }
+
+    float2 uv = (float2(pixel) + float2(0.5)) * _InvOutputDims;
+
+    //-------------------------------------------------------------------------
+    // 2) Select the nearest source sample inside the source footprint
+    //-------------------------------------------------------------------------
+#if NSS_DEPTH_SCATTER_QUARTER_RES_INPUT
+    int32_t2 src_size = int32_t2(round(float2(_OutputDims) * _Scale));
+    int32_t2 src_base = int32_t2(float2(pixel) * _Scale);
+    float2 inv_src_size = _InvOutputDims * _InvScale;
+
+    // Use 4 gathers to cover the quarter-res 4x4 input footprint:
+    // q00: (0,0) (1,0) (0,1) (1,1)
+    // q10: (2,0) (3,0) (2,1) (3,1)
+    // q01: (0,2) (1,2) (0,3) (1,3)
+    // q11: (2,2) (3,2) (2,3) (3,3)
+    float4 d00 = textureGather(_DepthTex, (float2(src_base + int32_t2(0, 0)) + float2(0.5)) * inv_src_size, 0).wzxy;
+    float4 x00 = textureGather(_MotionTex, (float2(src_base + int32_t2(0, 0)) + float2(0.5)) * inv_src_size, 0).wzxy;
+    float4 y00 = textureGather(_MotionTex, (float2(src_base + int32_t2(0, 0)) + float2(0.5)) * inv_src_size, 1).wzxy;
+    float4 d10 = textureGather(_DepthTex, (float2(src_base + int32_t2(2, 0)) + float2(0.5)) * inv_src_size, 0).wzxy;
+    float4 x10 = textureGather(_MotionTex, (float2(src_base + int32_t2(2, 0)) + float2(0.5)) * inv_src_size, 0).wzxy;
+    float4 y10 = textureGather(_MotionTex, (float2(src_base + int32_t2(2, 0)) + float2(0.5)) * inv_src_size, 1).wzxy;
+    float4 d01 = textureGather(_DepthTex, (float2(src_base + int32_t2(0, 2)) + float2(0.5)) * inv_src_size, 0).wzxy;
+    float4 x01 = textureGather(_MotionTex, (float2(src_base + int32_t2(0, 2)) + float2(0.5)) * inv_src_size, 0).wzxy;
+    float4 y01 = textureGather(_MotionTex, (float2(src_base + int32_t2(0, 2)) + float2(0.5)) * inv_src_size, 1).wzxy;
+    float4 d11 = textureGather(_DepthTex, (float2(src_base + int32_t2(2, 2)) + float2(0.5)) * inv_src_size, 0).wzxy;
+    float4 x11 = textureGather(_MotionTex, (float2(src_base + int32_t2(2, 2)) + float2(0.5)) * inv_src_size, 0).wzxy;
+    float4 y11 = textureGather(_MotionTex, (float2(src_base + int32_t2(2, 2)) + float2(0.5)) * inv_src_size, 1).wzxy;
+
+    float3 result = float3(x00.x, y00.x, d00.x);
+
+    #define NSS_UPDATE_NEAREST_STEP(OFF_X, OFF_Y, DEPTH, MOTION_X, MOTION_Y)                               \
+        {                                                                                                   \
+            int32_t2 _src = src_base + int32_t2((OFF_X), (OFF_Y));                                         \
+            float _d = (DEPTH);                                                                             \
+            float _take = float(IsOnScreen(_src, src_size)) * step(_d, result.z);                          \
+            result = mix(result, float3((MOTION_X), (MOTION_Y), _d), _take);                               \
+        }
+
+    NSS_UPDATE_NEAREST_STEP(1, 0, d00.y, x00.y, y00.y);
+    NSS_UPDATE_NEAREST_STEP(0, 1, d00.z, x00.z, y00.z);
+    NSS_UPDATE_NEAREST_STEP(1, 1, d00.w, x00.w, y00.w);
+    NSS_UPDATE_NEAREST_STEP(2, 0, d10.x, x10.x, y10.x);
+    NSS_UPDATE_NEAREST_STEP(3, 0, d10.y, x10.y, y10.y);
+    NSS_UPDATE_NEAREST_STEP(2, 1, d10.z, x10.z, y10.z);
+    NSS_UPDATE_NEAREST_STEP(3, 1, d10.w, x10.w, y10.w);
+    NSS_UPDATE_NEAREST_STEP(0, 2, d01.x, x01.x, y01.x);
+    NSS_UPDATE_NEAREST_STEP(1, 2, d01.y, x01.y, y01.y);
+    NSS_UPDATE_NEAREST_STEP(0, 3, d01.z, x01.z, y01.z);
+    NSS_UPDATE_NEAREST_STEP(1, 3, d01.w, x01.w, y01.w);
+    NSS_UPDATE_NEAREST_STEP(2, 2, d11.x, x11.x, y11.x);
+    NSS_UPDATE_NEAREST_STEP(3, 2, d11.y, x11.y, y11.y);
+    NSS_UPDATE_NEAREST_STEP(2, 3, d11.z, x11.z, y11.z);
+    NSS_UPDATE_NEAREST_STEP(3, 3, d11.w, x11.w, y11.w);
+
+    #undef NSS_UPDATE_NEAREST_STEP
+#else
+    // Match Slang gather ordering by swizzling GLSL `textureGather` result.
+    // The target order is TL, TR, BL, BR.
+    float4 dquad = textureGather(_DepthTex, uv, 0).wzxy;
+    float4 xquad = textureGather(_MotionTex, uv, 0).wzxy;
+    float4 yquad = textureGather(_MotionTex, uv, 1).wzxy;
+
+    // Choose the motion/depth sample corresponding to nearest depth.
+    float3 result = float3(xquad.x, yquad.x, dquad.x);
+    result = mix(result, float3(xquad.y, yquad.y, dquad.y), step(dquad.y, result.z));
+    result = mix(result, float3(xquad.z, yquad.z, dquad.z), step(dquad.z, result.z));
+    result = mix(result, float3(xquad.w, yquad.w, dquad.w), step(dquad.w, result.z));
+#endif // NSS_DEPTH_SCATTER_QUARTER_RES_INPUT
+
+    //-------------------------------------------------------------------------
+    // 3) Motion conditioning and reprojection
+    //-------------------------------------------------------------------------
+    float depth_dilated = result.z;
+    // SR 移植：_MotionTex 里是「backward 归一化 UV × upscaleRatio」，_MotionToPixels
+    // （= +renderSize × render/screen，只补幅度、不翻符号）把它换算成 Arm 期望的
+    // 「backward 屏幕空间像素位移」（见 UBO 说明）。
+    float2 motion_px = result.xy * _MotionToPixels;
+    float2 motion = motion_px * _InvScale;
+#if NSS_DEPTH_SCATTER_QUARTER_RES_INPUT
+    motion *= float(length(motion_px) > kMotionThreshold); // suppress tiny vectors before 135p scaling
+#else
+    motion *= float(length(motion_px) > kMotionThreshold); // suppress tiny vectors
+#endif // NSS_DEPTH_SCATTER_QUARTER_RES_INPUT
+    motion *= _InvOutputDims;                          // px -> uv
+
+    //-------------------------------------------------------------------------
+    // 4) Scatter reconstructed previous depth
+    //-------------------------------------------------------------------------
+    // ★ 与官方 ffx_nss_depth_scatter.h:198 逐字一致（加号）：
+    //     float2 reproj_uv = uv + motion;
+    //   `_MotionToPixels` 已把纹理值换算成 Arm 期望的 backward 屏幕空间像素
+    //   位移（只补幅度，符号交给 `+`），因此这里必须与官方一样用加号。
+    float2 reproj_uv = uv + motion;
+    ReconstructPrevDepth(depth_dilated, reproj_uv);
+}

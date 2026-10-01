@@ -36,6 +36,7 @@ import io.homo.superresolution.common.minecraft.handler.shadercompat.MacroRegist
 import io.homo.superresolution.common.minecraft.handler.shadercompat.SRCompatConfigParser;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.SRCompatProcessor;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.SRShaderCompatData;
+import io.homo.superresolution.common.minecraft.handler.shadercompat.ShaderpackJitterCompensation;
 import io.homo.superresolution.common.minecraft.handler.shadercompat.UniformRegistrar;
 import io.homo.superresolution.common.upscale.AlgorithmDescriptions;
 import io.homo.superresolution.common.upscale.AlgorithmManager;
@@ -118,6 +119,7 @@ public class SRCompatV3Processor implements SRCompatProcessor {
 
     @Override
     public Vector2f adaptJitterForShaderpack(Vector2f rawJitter, AbstractAlgorithm algorithm, SRShaderCompatData config, AlgorithmDescription<?> description) {
+        Vector2f adapted;
         if (
                 description.equals(AlgorithmDescriptions.FSR) ||
                         description.equals(AlgorithmDescriptions.DLSS) ||
@@ -125,10 +127,14 @@ public class SRCompatV3Processor implements SRCompatProcessor {
                         description.equals(AlgorithmDescriptions.XESS) ||
                         description.equals(AlgorithmDescriptions.FSR4_D3D12)
         ) {
-            return rawJitter.mul(1, -1);
+            adapted = rawJitter.mul(1, -1);
         } else {
-            return rawJitter;
+            adapted = rawJitter;
         }
+        // 补偿光影 texelSize 用的是物理屏幕尺寸导致的幅度偏差（详见
+        // ShaderpackJitterCompensation 的说明）。NSS 同样需要这一步：
+        // 它的 _JitterOffset 按 ±0.5 渲染像素消费，光影也必须施加同样的量。
+        return ShaderpackJitterCompensation.compensate(adapted);
     }
 
     @Override

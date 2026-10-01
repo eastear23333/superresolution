@@ -1003,6 +1003,19 @@ public class GlCommandDecoder implements ICommandDecoder {
                 }
                 yield ResourceAccessType.STORAGE_READ_WRITE;
             }
+            // SSBO：按 shader 里声明的访问权限推导（readonly/writeonly/可读写）
+            case STORAGE_BUFFER -> {
+                ShaderResourceDescription desc = pipeline.shader().getDescription()
+                        .resourcesLayout().getResource(name);
+                if (desc != null) {
+                    yield switch (desc.access()) {
+                        case Read -> ResourceAccessType.STORAGE_READ;
+                        case Write -> ResourceAccessType.STORAGE_WRITE;
+                        case Both -> ResourceAccessType.STORAGE_READ_WRITE;
+                    };
+                }
+                yield ResourceAccessType.STORAGE_READ_WRITE;
+            }
             case UNIFORM_BUFFER -> ResourceAccessType.SAMPLED_READ;
         };
     }

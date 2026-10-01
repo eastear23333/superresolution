@@ -31,6 +31,8 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.lwjgl.opengl.GL33.*;
+import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
+import static org.lwjgl.opengl.GL43.glShaderStorageBlockBinding;
 
 public class GlPipelineDescriptorSet extends PipelineDescriptorSet {
     private final Map<String, Integer> uniformLocations = new HashMap<>();
@@ -77,6 +79,24 @@ public class GlPipelineDescriptorSet extends PipelineDescriptorSet {
                         if (stateCache != null) {
                             stateCache.recordUniformBufferBinding(binding.bindingPoint(), buffer.handle(), binding.offset(), binding.range());
                         }
+                    }
+                }
+
+                case STORAGE_BUFFER -> {
+                    // SSBO：GL 4.3+。先把 shader 里的 block 绑到 bindingPoint，
+                    // 再把 buffer 绑到同一个 point。
+                    IBuffer buffer = (IBuffer) binding.resource();
+                    int blockIndex = getShaderStorageBlockIndex(name);
+                    if (blockIndex == GL_INVALID_INDEX) {
+                        throw new RuntimeException("Shader storage block '%s' not found".formatted(name));
+                    }
+                    glShaderStorageBlockBinding(programHandle, blockIndex, binding.bindingPoint());
+                    if (binding.offset() > 0 || binding.range() != buffer.getSize()) {
+                        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, binding.bindingPoint(),
+                                (int) buffer.handle(), binding.offset(), binding.range());
+                    } else {
+                        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding.bindingPoint(),
+                                (int) buffer.handle());
                     }
                 }
 
@@ -149,6 +169,16 @@ public class GlPipelineDescriptorSet extends PipelineDescriptorSet {
 
     private int getUniformBlockIndex(String name) {
         return uniformBlockIndices.computeIfAbsent(name, key -> glGetUniformBlockIndex((int) shader.handle(), key));
+    }
+
+    private final java.util.Map<String, Integer> shaderStorageBlockIndices = new java.util.HashMap<>();
+
+    private int getShaderStorageBlockIndex(String name) {
+        return shaderStorageBlockIndices.computeIfAbsent(name,
+                key -> org.lwjgl.opengl.GL43.glGetProgramResourceIndex(
+                        (int) shader.handle(),
+                        org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BLOCK,
+                        key));
     }
 
     @Override

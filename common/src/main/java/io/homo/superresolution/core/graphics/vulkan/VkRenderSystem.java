@@ -40,6 +40,7 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.system.MemoryUtil.memUTF8;
 import static org.lwjgl.vulkan.EXTMutableDescriptorType.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
 import static org.lwjgl.vulkan.EXTPrivateData.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES_EXT;
+import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
 import static org.lwjgl.vulkan.KHRDynamicRendering.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
 import static org.lwjgl.vulkan.KHRDynamicRenderingLocalRead.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR;
 
@@ -304,7 +305,21 @@ public class VkRenderSystem implements IRenderSystem {
                     VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR.calloc(stack)
                             .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR)
                             .pNext(privateDataFeatures.address());
-            mutableDescriptorTypeFeaturesEXT.pNext(shaderIntegerDotProductFeaturesKHR.address());
+            /*
+             * VK_KHR_cooperative_matrix：Arm NSS 的 Tensor Core（int8 MMA）推理后端前提。
+             * 只有设备确实暴露该扩展时才把它挂进 pNext —— 把「扩展未启用」的结构体放进
+             * 链里在规范上属于未定义行为。设备不支持时保持原链不变。
+             */
+            boolean hasCooperativeMatrixExtension = supportedDeviceExts.contains("VK_KHR_cooperative_matrix");
+            VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperativeMatrixFeatures = null;
+            if (hasCooperativeMatrixExtension) {
+                cooperativeMatrixFeatures = VkPhysicalDeviceCooperativeMatrixFeaturesKHR.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR)
+                        .pNext(shaderIntegerDotProductFeaturesKHR.address());
+                mutableDescriptorTypeFeaturesEXT.pNext(cooperativeMatrixFeatures.address());
+            } else {
+                mutableDescriptorTypeFeaturesEXT.pNext(shaderIntegerDotProductFeaturesKHR.address());
+            }
 
             VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRenderingFeatures =
                     VkPhysicalDeviceDynamicRenderingFeaturesKHR.calloc(stack)
@@ -356,8 +371,32 @@ public class VkRenderSystem implements IRenderSystem {
             boolean deviceSupportsMutableDescriptor = mutableDescriptorTypeFeaturesEXT.mutableDescriptorType();
             boolean deviceSupportsShaderInt8 = features12.shaderInt8();
             boolean deviceSupportsShaderInt16 = features2.features().shaderInt16();
+            // NSS 的 DP4A 后端在 requantize 里用 64 位乘法，缺这个特性会直接拒绝设备。
+            // 它属于 VkPhysicalDeviceFeatures（核心 1.0），与 shaderInt16 同一层。
+            boolean deviceSupportsShaderInt64 = features2.features().shaderInt64();
             boolean deviceSupportsShaderFloat16 = features12.shaderFloat16();
+            /*
+             * NSS 的 DP4A 后端把输入张量/权重/中间张量全部声明为
+             * `layout(...) buffer { int8_t ...; }` —— 即 8 位整型的 storage buffer。
+             * 这类声明要求 device 侧启用 VkPhysicalDeviceVulkan12Features::
+             * storageBuffer8BitAccess，否则 vkCreateShaderModule 直接报
+             *   VUID-RuntimeSpirv-storageBuffer8BitAccess-06328
+             *   「SPIR-V contains an 8-bit OpVariable with StorageBuffer Storage Class,
+             *     but storageBuffer8BitAccess was not enabled」
+             * 结果是 compute 管线全部创建失败 → vkCmdDispatch 报
+             * VUID-vkCmdDispatch-None-08600 → 整个 NSS 路径失效。
+             *
+             * 注意它与 shaderInt8 是两个独立特性：shaderInt8 允许在 shader 里
+             * 做 8 位运算，storageBuffer8BitAccess 允许 8 位类型出现在 storage
+             * buffer 的布局中。DP4A 内核两者都需要。
+             * Turing（GTX 1660 Ti）及以上均支持。
+             */
+            boolean deviceSupportsStorageBuffer8BitAccess = features12.storageBuffer8BitAccess();
             boolean deviceSupportsShaderIntegerDotProduct = shaderIntegerDotProductFeaturesKHR.shaderIntegerDotProduct();
+            // Arm NSS Tensor Core 后端前提：扩展存在 且 设备报告 cooperativeMatrix=true。
+            // NSS 侧会再独立探测可用的 int8 形状（M16N16K32 / M16N8K32），二者都满足才走 MMA。
+            boolean deviceSupportsCooperativeMatrix = hasCooperativeMatrixExtension
+                    && cooperativeMatrixFeatures.cooperativeMatrix();
             boolean deviceSupportsShaderStorageImageWriteWithoutFormat = features2.features().shaderStorageImageWriteWithoutFormat();
             boolean deviceSupportsBufferDeviceAddress = features12.bufferDeviceAddress();
             boolean deviceSupportsDescriptorIndexing = features12.descriptorIndexing();
@@ -372,10 +411,13 @@ public class VkRenderSystem implements IRenderSystem {
             LOGGER.info("Vulkan device feature support:");
             LOGGER.info("  mutableDescriptorType: {}", deviceSupportsMutableDescriptor);
             LOGGER.info("  shaderInt8: {}", deviceSupportsShaderInt8);
+            LOGGER.info("  storageBuffer8BitAccess: {}", deviceSupportsStorageBuffer8BitAccess);
             LOGGER.info("  shaderInt16: {}", deviceSupportsShaderInt16);
+            LOGGER.info("  shaderInt64: {}", deviceSupportsShaderInt64);
             LOGGER.info("  shaderFloat16: {}", deviceSupportsShaderFloat16);
             LOGGER.info("  shaderStorageImageWriteWithoutFormat: {}", deviceSupportsShaderStorageImageWriteWithoutFormat);
             LOGGER.info("  shaderIntegerDotProduct: {}", deviceSupportsShaderIntegerDotProduct);
+            LOGGER.info("  cooperativeMatrix: {}", deviceSupportsCooperativeMatrix);
             LOGGER.info("  bufferDeviceAddress: {}", deviceSupportsBufferDeviceAddress);
             LOGGER.info("  descriptorIndexing: {}", deviceSupportsDescriptorIndexing);
             LOGGER.info("  dynamicRendering: {}", deviceSupportsDynamicRendering);
@@ -416,7 +458,17 @@ public class VkRenderSystem implements IRenderSystem {
                             .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR)
                             .pNext(devicePrivateDataFeatures.address())
                             .shaderIntegerDotProduct(deviceSupportsShaderIntegerDotProduct);
-            deviceMutableFeatures.pNext(deviceShaderIntFeatures.address());
+            if (deviceSupportsCooperativeMatrix) {
+                // 与查询链同构：扩展真正启用时才把特性结构挂进设备创建链。
+                VkPhysicalDeviceCooperativeMatrixFeaturesKHR deviceCooperativeMatrixFeatures =
+                        VkPhysicalDeviceCooperativeMatrixFeaturesKHR.calloc(stack)
+                                .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR)
+                                .cooperativeMatrix(true)
+                                .pNext(deviceShaderIntFeatures.address());
+                deviceMutableFeatures.pNext(deviceCooperativeMatrixFeatures.address());
+            } else {
+                deviceMutableFeatures.pNext(deviceShaderIntFeatures.address());
+            }
 
             VkPhysicalDeviceDynamicRenderingFeaturesKHR deviceDynamicRenderingFeatures =
                     VkPhysicalDeviceDynamicRenderingFeaturesKHR.calloc(stack)
@@ -460,6 +512,9 @@ public class VkRenderSystem implements IRenderSystem {
                     .pNext(deviceFeatureChain)
                     .shaderFloat16(deviceSupportsShaderFloat16)
                     .shaderInt8(deviceSupportsShaderInt8)
+                    /* NSS DP4A 内核声明 int8 storage buffer 必需，缺它会
+                     * 让 vkCreateShaderModule 报 VUID-RuntimeSpirv-storageBuffer8BitAccess-06328 */
+                    .storageBuffer8BitAccess(deviceSupportsStorageBuffer8BitAccess)
                     .bufferDeviceAddress(deviceSupportsBufferDeviceAddress)
                     .timelineSemaphore(deviceSupportsTimelineSemaphore)
                     .descriptorIndexing(deviceSupportsDescriptorIndexing);
@@ -468,6 +523,9 @@ public class VkRenderSystem implements IRenderSystem {
                     .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
                     .pNext(deviceFeatures12.address());
             deviceFeatures2.features().shaderInt16(deviceSupportsShaderInt16);
+            // NSS 的 DP4A 后端要求设备已启用 shaderInt64（requantize 的 64 位乘法），
+            // 否则 nssDp4aCreateContext 会在能力检查阶段直接拒绝。Turing 及以后都支持。
+            deviceFeatures2.features().shaderInt64(deviceSupportsShaderInt64);
             deviceFeatures2.features().shaderStorageImageWriteWithoutFormat(deviceSupportsShaderStorageImageWriteWithoutFormat);
             VkDeviceCreateInfo createInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)

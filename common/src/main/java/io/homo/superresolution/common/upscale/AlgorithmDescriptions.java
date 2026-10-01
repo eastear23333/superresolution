@@ -42,6 +42,7 @@ import io.homo.superresolution.common.upscale.algo.legacy.fsr2.FSR2;
 import io.homo.superresolution.common.upscale.algo.legacy.sgsr.v1.Sgsr1;
 import io.homo.superresolution.common.upscale.algo.legacy.sgsr.v2.Sgsr2;
 import io.homo.superresolution.common.upscale.algo.none.None;
+import io.homo.superresolution.common.upscale.algo.nss.NSS;
 import io.homo.superresolution.common.upscale.algo.xess.XeSS;
 import io.homo.superresolution.core.NativeLibManager;
 import io.homo.superresolution.core.graphics.opengl.Gl;
@@ -389,6 +390,77 @@ public class AlgorithmDescriptions {
             .customUpscaleRatio(false)
             .build();
 
+    /**
+     * Arm NSS 的质量档（超分比例）。
+     *
+     * <p><b>非 2x 比例的支持依据</b>（官方文档与源码）：
+     * <ul>
+     *   <li>{@code docs/user_guide.md:580}：「The SDK supports flexible upscaling
+     *       ratios. Exact 2x uses the static LUT path with the lowest overhead.
+     *       Non-2x ratios enable dynamic LUT generation with cost proportional
+     *       to modulo tile count.」</li>
+     *   <li>{@code docs/user_guide.md:1252}：「NSS is optimized for 2x upscaling.
+     *       Other scale factors are supported but can have reduced quality.」</li>
+     *   <li>{@code ffx_nss.cpp:609} 对 ratio &gt; 2 只打 warning（非拒绝）。</li>
+     * </ul>
+     *
+     * <p><b>档位选择的数学约束</b>：非 2x 走动态 offset LUT，其尺寸由
+     * {@code reducedFractionHrSize = screenSize / gcd(screenSize, renderSize)}
+     * 决定（官方 {@code ffx_nss.cpp:739-747}）。由于 {@code renderSize} 是
+     * {@code floor(screenSize / ratio)}，某些「比例 × 分辨率」组合会让 gcd
+     * 退化成 1，使 LUT 膨胀到上千万格（显存爆炸）。本实现设了运行时保护
+     * （超限自动退化到静态 2x 路径，仅损失画质不崩溃），下面列出的档位是
+     * 在 1080p/1440p/4K 下验证过的安全值。
+     *
+     * <p>与模型档位（{@link NSSModel}）是**两个独立的轴**：比例决定渲染
+     * 分辨率，模型档决定用哪份权重与预处理分辨率。
+     */
+    /**
+     * Arm NSS 的质量档（超分比例）。
+     *
+     * <p><b>目前仅提供 2.0x</b>：官方动态 offset LUT 机制（非 2x 档必需）在
+     * 「比例 × 分辨率」组合不良时会让 LUT 格点数爆炸（例：1.75x + 1080p →
+     * 1920×1080 ≈ 2M 格 ≈ 99MB），需配套渲染尺寸吸附策略后再开放。
+     * 详见 {@code docs} 与 2026-09-27 工作记录。
+     *
+     * <p>与模型档位（{@link NSSModel}）是**两个独立的轴**：比例决定渲染
+     * 分辨率，模型档决定用哪份权重与预处理分辨率。
+     */
+    private static final List<QualityPreset> NSS_QUALITY_PRESETS = List.of(
+            new QualityPreset()
+                    .setName(Component.translatable("superresolution.algo.preset.nss.performance"))
+                    .setCodeName("nss_performance")
+                    .setUpscaleRatio(2.0f)
+    );
+    public static final AlgorithmDescription<NSS> NSS = AlgorithmDescription.builder(NSS.class)
+            .briefName("Arm NSS")
+            .codeName("nss")
+            .displayName("Arm Neural Super Sampling (DP4A)")
+            .requirement(
+                    Requirement.nothing()
+                            .addSupportedOS(new OperatingSystem(SystemArchitecture.X86_64, OperatingSystemType.WINDOWS))
+                            .requiredGlExtension("GL_EXT_memory_object")
+                            .requiredGlExtension("GL_EXT_semaphore")
+                            .glMajorVersion(4)
+                            .glMinorVersion(6)
+                            .requireVulkan(true)
+                            .isTrue(AlgorithmDescriptions::isNssDp4aAvailable)
+            )
+            .supportJitter(true)
+            .qualityPresets(NSS_QUALITY_PRESETS)
+            .customUpscaleRatio(false)
+            .build();
+
+    /** NSS 需要 DP4A 硬件路径 + shaderInt64。轻量探测：先看显卡名字符串，
+     *  精确判定由 native 侧 nssDp4aQueryDeviceCaps 在上下文创建时完成。 */
+    private static boolean isNssDp4aAvailable() {
+        try {
+            return NativeLibManager.LIB_SUPER_RESOLUTION_NSS != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     public static void registryAlgorithms() {
         AlgorithmRegistry.registry(NONE);
         AlgorithmRegistry.registry(FSR1);
@@ -402,6 +474,7 @@ public class AlgorithmDescriptions {
         }
         AlgorithmRegistry.registry(SGSR1);
         AlgorithmRegistry.registry(SGSR2);
+        AlgorithmRegistry.registry(NSS);
         if (Platform.currentPlatform.isDevelopmentEnvironment()) {
             AlgorithmRegistry.registry(ANIME4K);
         }

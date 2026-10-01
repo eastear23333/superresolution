@@ -25,6 +25,9 @@ import io.homo.superresolution.core.graphics.impl.texture.TextureFormat;
 public class FramebufferDescription {
     private ITexture colorAttachment;
     private ITexture depthAttachment;
+    /// 额外的颜色附件（MRT）。索引 1 起；索引 0 仍是 colorAttachment。
+    /// NSS 的 pre_process 需要双输出（_LumaDerivOut + _NearestDepthOffsetOut）。
+    private final java.util.List<ITexture> extraColorAttachments = new java.util.ArrayList<>();
     private TextureFormat colorFormat;
     private TextureFormat depthFormat;
     private int width;
@@ -40,6 +43,20 @@ public class FramebufferDescription {
 
     public ITexture getColorAttachment() {
         return colorAttachment;
+    }
+
+    /// 全部颜色附件，索引 0 为主颜色附件。无 MRT 时返回单元素或空列表。
+    public java.util.List<ITexture> getColorAttachments() {
+        java.util.List<ITexture> all = new java.util.ArrayList<>();
+        if (colorAttachment != null) {
+            all.add(colorAttachment);
+        }
+        all.addAll(extraColorAttachments);
+        return all;
+    }
+
+    public int getColorAttachmentCount() {
+        return (colorAttachment != null ? 1 : 0) + extraColorAttachments.size();
     }
 
     public ITexture getDepthAttachment() {
@@ -101,6 +118,26 @@ public class FramebufferDescription {
 
         public Builder colorAttachment(ITexture colorTexture) {
             description.colorAttachment = colorTexture;
+            return this;
+        }
+
+        /// 追加一个 MRT 颜色附件（索引 1 起）。必须先设置 colorAttachment。
+        public Builder extraColorAttachment(ITexture colorTexture) {
+            description.extraColorAttachments.add(colorTexture);
+            return this;
+        }
+
+        /// 一次性设置全部颜色附件：第 0 个为主附件，其余为 MRT 附件。
+        public Builder colorAttachments(java.util.List<ITexture> attachments) {
+            description.extraColorAttachments.clear();
+            description.colorAttachment = null;
+            for (int i = 0; i < attachments.size(); i++) {
+                if (i == 0) {
+                    description.colorAttachment = attachments.get(i);
+                } else {
+                    description.extraColorAttachments.add(attachments.get(i));
+                }
+            }
             return this;
         }
 

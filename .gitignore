@@ -153,3 +153,10 @@ __pycache__
 /AGENTS.md
 /docs/agents
 /.workdir
+# NSS local build artifacts (handover: source-only)
+/dist_test/
+/native/cpp/buildNSS/
+/native/cpp/buildNSSDebug/
+/native/cpp/buildNSS_manual/
+/native/cpp/buildTest/
+/native/cpp/SRNativeNSS/third_party/nss_dp4a/bin/*.bak-*

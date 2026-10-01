@@ -301,5 +301,9 @@
     "superresolution.screen.config.hint.shader_compat_warning.text.compat": "目前光影尚未適配超解析度模組，將以相容模式運行。此模式下可能出現畫面模糊、重影鬼影、效能下降、與其他模組相容性降低等問題。",
     "superresolution.screen.config.hint.shader_compat_warning.text.disabled": "目前光影尚未適配超解析度模組，超解析度已停用。開啟「啟用未適配光影相容模式」並重新啟動遊戲後，將以相容模式運行，但可能出現畫面模糊、重影鬼影、效能下降、與其他模組相容性降低等問題。",
     "superresolution.screen.config.hint.frame_generation_only_warning.title": "僅啟用幀生成模式",
-    "superresolution.screen.config.hint.frame_generation_only_warning.text": "此光影使用僅幀生成模式，超解析度功能已停用"
+    "superresolution.screen.config.hint.frame_generation_only_warning.text": "此光影使用僅幀生成模式，超解析度功能已停用",
+    "superresolution.algo.preset.nss.ultra_quality": "極致品質",
+    "superresolution.algo.preset.nss.quality": "品質",
+    "superresolution.algo.preset.nss.performance": "效能",
+    "superresolution.algo.preset.nss.ultra_performance": "極致效能"
 }

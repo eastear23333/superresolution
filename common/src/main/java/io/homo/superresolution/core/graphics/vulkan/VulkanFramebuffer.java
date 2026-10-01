@@ -29,6 +29,8 @@ import static org.lwjgl.vulkan.VK10.VK_NULL_HANDLE;
 public class VulkanFramebuffer implements IFrameBuffer {
     private final VulkanDevice device;
     private final ITexture colorAttachment;
+    /// MRT 附加颜色附件（索引 1 起）。索引 0 是 colorAttachment。
+    private final List<ITexture> extraColorAttachments = new ArrayList<>();
     private final ITexture depthAttachment;
     private final int width;
     private final int height;
@@ -39,6 +41,11 @@ public class VulkanFramebuffer implements IFrameBuffer {
         this.width = description.getWidth();
         this.height = description.getHeight();
         this.label = description.getLabel();
+        this.extraColorAttachments.addAll(description.getColorAttachments());
+        // getColorAttachments() 的第 0 个就是主附件，去掉它剩下的才是额外附件
+        if (!this.extraColorAttachments.isEmpty()) {
+            this.extraColorAttachments.remove(0);
+        }
 
         if (description.getColorAttachment() != null) {
             this.colorAttachment = description.getColorAttachment();
@@ -157,6 +164,9 @@ public class VulkanFramebuffer implements IFrameBuffer {
         if (colorAttachment != null) {
             list.add(new ColorAttachment(0, colorAttachment));
         }
+        for (int i = 0; i < extraColorAttachments.size(); i++) {
+            list.add(new ColorAttachment(i + 1, extraColorAttachments.get(i)));
+        }
         return list;
     }
 
@@ -217,6 +227,41 @@ public class VulkanFramebuffer implements IFrameBuffer {
 
     public ITexture getColorAttachmentTexture() {
         return colorAttachment;
+    }
+
+    /// MRT 附加颜色附件的视图句柄列表（不含主附件），按索引 1..n 排序。
+    public List<Long> resolveExtraColorImageViews() {
+        List<Long> views = new ArrayList<>();
+        for (ITexture tex : extraColorAttachments) {
+            views.add(resolveAttachmentView(tex));
+        }
+        return views;
+    }
+
+    public List<ITexture> getExtraColorAttachmentTextures() {
+        return List.copyOf(extraColorAttachments);
+    }
+
+    /// 全部颜色附件的视图句柄（索引 0 为主附件），供 vkCmdBeginRendering 使用。
+    public List<Long> resolveAllColorImageViews() {
+        List<Long> views = new ArrayList<>();
+        if (colorAttachment != null) {
+            views.add(resolveAttachmentView(colorAttachment));
+        }
+        views.addAll(resolveExtraColorImageViews());
+        return views;
+    }
+
+    /// 全部颜色附件的纹理格式（索引 0 为主附件），供 VkPipelineRenderingCreateInfo 使用。
+    public List<Integer> resolveAllColorFormats() {
+        List<Integer> formats = new ArrayList<>();
+        if (colorAttachment != null) {
+            formats.add(colorAttachment.getTextureFormat().vk());
+        }
+        for (ITexture tex : extraColorAttachments) {
+            formats.add(tex.getTextureFormat().vk());
+        }
+        return formats;
     }
 
     public ITexture getDepthAttachmentTexture() {

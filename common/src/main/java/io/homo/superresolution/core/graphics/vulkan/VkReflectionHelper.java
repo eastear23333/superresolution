@@ -19,6 +19,7 @@
 package io.homo.superresolution.core.graphics.vulkan;
 
 import org.lwjgl.PointerBuffer;
+import org.lwjgl.glfw.GLFW;
 import org.lwjgl.system.Checks;
 import org.lwjgl.system.FunctionProvider;
 import org.lwjgl.system.MemoryStack;
@@ -76,8 +77,19 @@ public class VkReflectionHelper {
     private static final MethodHandle newVKCapabilitiesInstance = runReflective(() -> IMPL_LOOKUP.findConstructor(VKCapabilitiesInstance.class, MethodType.methodType(void.class, FunctionProvider.class, int.class, Set.class, Set.class)));
     private static final MethodHandle getEnabledExtensionSet = runReflective(() -> IMPL_LOOKUP.findStatic(VK.class, "getEnabledExtensionSet", MethodType.methodType(Set.class, int.class, PointerBuffer.class)));
     // reflection replacement for VK's package-private methods.
+    //
+    // 注意：LWJGL 3.4.x 起 VK$GlobalCommands.vkGetInstanceProcAddr 变成了 final 字段，
+    // 而 MethodHandles.Lookup.findVarHandle 会拒绝 final 字段（抛 IllegalStateException），
+    // 导致整个类的静态初始化失败、getVkGetInstanceProcAddr() 永远拿不到值。
+    // 这里改用 Unsafe 读字段偏移：对 final / 任意可见性的实例字段都安全。
+    // 同时兼容 3.4.x 把大部分全局函数挪到 VKCapabilitiesGlobal 的改动：
+    // 优先从 VK$GlobalCommands 取，取不到再退回 VKCapabilitiesGlobal。
     private static final Class<?> GlobalCommands = runReflective(() -> Class.forName("org.lwjgl.vulkan.VK$GlobalCommands"));
-    private static final VarHandle vkGetInstanceProcAddr = runReflective(() -> IMPL_LOOKUP.findVarHandle(GlobalCommands, "vkGetInstanceProcAddr", long.class));
+    private static final long vkGetInstanceProcAddrOffset = runReflective(() -> {
+        Field f = GlobalCommands.getDeclaredField("vkGetInstanceProcAddr");
+        f.setAccessible(true);
+        return UNSAFE.objectFieldOffset(f);
+    });
     private static final MethodHandle getGlobalCommands = runReflective(() -> IMPL_LOOKUP.findStatic(VK.class, "getGlobalCommands", MethodType.methodType(GlobalCommands)));
 
     public static VkInstance createVkInstanceSafely(long handle, VkInstanceCreateInfo ci) {
@@ -172,12 +184,39 @@ public class VkReflectionHelper {
         return extensions;
     }
 
+    /**
+     * 取 vkGetInstanceProcAddr 的函数地址。
+     * <p>
+     * 这是 NSS/DP4A 等 native 后端能拿到 loader 入口的唯一来源；一旦返回 0，
+     * native 侧会报 "vkGetInstanceProcAddr 失败 / vulkan call failed"。
+     * 因此这里不再抛异常，而是逐级兜底，保证尽量拿到非零地址。
+     */
     public static long getVkGetInstanceProcAddr() {
+        // 1) 优先：VK$GlobalCommands 实例的 vkGetInstanceProcAddr 字段（3.3.x / 3.4.x 通用）
         try {
-            return (Long) vkGetInstanceProcAddr.get(getGlobalCommands.invoke());
-        } catch (Throwable ex) {
-            throw new RuntimeException(ex);
+            Object commands = getGlobalCommands.invoke();
+            if (commands != null) {
+                long addr = UNSAFE.getLong(commands, vkGetInstanceProcAddrOffset);
+                if (addr != 0L) {
+                    return addr;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 落到下面的兜底路径
         }
+
+        // 2) 兜底：直接向 GLFW 要 loader 入口。GLFW 内部就是动态加载 vulkan-1.dll 的，
+        //    这一路不依赖任何 LWJGL 内部结构，跨版本最稳。
+        try {
+            long addr = GLFW.glfwGetProcAddress("vkGetInstanceProcAddr");
+            if (addr != 0L) {
+                return addr;
+            }
+        } catch (Throwable ignored) {
+            // 放弃
+        }
+
+        return 0L;
     }
 
     private static <T> T runReflective(Callable<T> getter) {

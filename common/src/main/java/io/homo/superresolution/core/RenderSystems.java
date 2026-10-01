@@ -207,7 +207,13 @@ public class RenderSystems {
                 .addDeviceExtension("VK_KHR_synchronization2")//DLSS-FG
                 .addDeviceExtension("VK_KHR_format_feature_flags2")//DLSS-FG
                 .addDeviceExtension("VK_KHR_timeline_semaphore")//DLSS-FG
-                .addDeviceExtension("VK_EXT_calibrated_timestamps");//DLSS-FG
+                .addDeviceExtension("VK_EXT_calibrated_timestamps")//DLSS-FG
+                /*
+                 * Arm NSS 的 Tensor Core 推理后端（int8 cooperative matrix MMA）需要它。
+                 * 设备不支持时会被 VkRenderSystem 的「按支持过滤」逻辑自动跳过，
+                 * NSS 那边的后端探测也会回落到 DP4A，因此这里无条件注册是安全的。
+                 */
+                .addDeviceExtension("VK_KHR_cooperative_matrix");
         if (Platform.currentPlatform.getOS().type == OperatingSystemType.WINDOWS) {
             vulkan.addDeviceExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME)
                     .addDeviceExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);

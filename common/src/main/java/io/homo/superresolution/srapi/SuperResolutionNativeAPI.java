@@ -18,6 +18,7 @@
 
 package io.homo.superresolution.srapi;
 
+import io.homo.superresolution.common.SuperResolution;
 import io.homo.superresolution.core.SuperResolutionNative;
 
 public class SuperResolutionNativeAPI {
@@ -82,6 +83,24 @@ public class SuperResolutionNativeAPI {
             SRDispatchUpscaleDesc desc
     ) {
         if (context.nativePtr < 1 || desc == null || desc.commandList == null) {
+            return SRReturnCode.ERROR;
+        }
+
+        /*
+         * 下面这次 JNI 调用会无条件解引用 jitterOffset / motionVectorScale /
+         * renderSize / upscaleSize 四个 Vector 的 .x/.y。任何一个为 null，
+         * 抛出的 NullPointerException 会一路冒到渲染线程并被上层吞掉
+         * （Iris 只会打印一次 "Further errors will not be logged"），
+         * 表现是「算法没报错但也没生效」，极难定位。
+         *
+         * 这里提前校验并打印具体缺了哪个字段 —— 调用方（各算法实现）漏设时
+         * 能一眼看出问题，而不是面对一个不带字段名的 NPE 栈。
+         */
+        if (desc.jitterOffset == null || desc.motionVectorScale == null
+                || desc.renderSize == null || desc.upscaleSize == null) {
+            SuperResolution.LOGGER.error(
+                    "srDispatchUpscale: 缺少必填的向量字段（jitterOffset={}, motionVectorScale={}, renderSize={}, upscaleSize={}）",
+                    desc.jitterOffset, desc.motionVectorScale, desc.renderSize, desc.upscaleSize);
             return SRReturnCode.ERROR;
         }
 

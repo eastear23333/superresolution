@@ -35,6 +35,8 @@ import io.homo.superresolution.core.graphics.impl.texture.TextureUsage;
 import io.homo.superresolution.core.graphics.impl.vertex.IVertexBuffer;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -53,6 +55,53 @@ public class ValidatedCommandDecoder implements ICommandDecoder {
         if (commandBuffer.state() != CommandBufferState.Recording) {
             throw new IllegalStateException(action + ": command buffer is not in Recording state (current: " + commandBuffer.state() + ")");
         }
+    }
+
+    /**
+     * 判断绑定的 render pass 与当前激活的 render pass 是否兼容。
+     *
+     * <p>本框架的 Vulkan 后端走 <b>dynamic rendering</b>（{@code VkPipelineRenderingCreateInfoKHR}），
+     * 管线只与附件的 <b>格式</b> 相关，不与某个具体的 render pass / framebuffer 实例绑定。
+     * 因此判断依据必须是「附件格式序列是否一致」，而不是引用相等。
+     *
+     * <p>典型场景：乒乓双缓冲会为每一侧各建一个 render pass（framebuffer 指向不同的纹理，
+     * 但格式完全一致）。管线只创建一次并绑定到第 0 个 pass，运行时交替使用两侧 ——
+     * 这在 Vulkan 侧完全合法，用 {@code ==} 判断会误报不匹配。
+     *
+     * <p>若传入同一个实例，直接短路返回 true（避免无谓的格式比对）。
+     */
+    private static boolean isCompatibleRenderPass(RenderPass pipelinePass, RenderPass activePass) {
+        if (pipelinePass == null || activePass == null) {
+            return pipelinePass == activePass;
+        }
+        if (pipelinePass == activePass) {
+            return true;
+        }
+        return attachmentFormatsOf(pipelinePass).equals(attachmentFormatsOf(activePass));
+    }
+
+    /**
+     * 提取 render pass 的附件格式序列（颜色附件按声明顺序，末尾跟深度/模板附件）。
+     *
+     * <p>只比较格式而不比较尺寸 —— 尺寸由 viewport / scissor 动态决定，
+     * 与管线无关。
+     */
+    private static List<TextureFormat> attachmentFormatsOf(RenderPass renderPass) {
+        List<TextureFormat> formats = new ArrayList<>();
+        IFrameBuffer frameBuffer = renderPass.frameBuffer();
+        if (frameBuffer == null) {
+            return formats;
+        }
+        for (ColorAttachment attachment : frameBuffer.getColorAttachments()) {
+            ITexture texture = attachment.texture();
+            formats.add(texture != null ? texture.getTextureFormat() : null);
+        }
+        DepthStencilAttachment depthStencil = frameBuffer.getDepthStencilAttachment();
+        if (depthStencil != null) {
+            ITexture texture = depthStencil.texture();
+            formats.add(texture != null ? texture.getTextureFormat() : null);
+        }
+        return formats;
     }
 
     private static void requireNonNull(Object obj, String action, String name) {
@@ -452,7 +501,7 @@ public class ValidatedCommandDecoder implements ICommandDecoder {
         if (activeRenderPass == null) {
             throw new IllegalStateException("bindPipeline(graphics): no active render pass. Call beginRenderPass() first.");
         }
-        if (pipeline.renderPass() != activeRenderPass) {
+        if (!isCompatibleRenderPass(pipeline.renderPass(), activeRenderPass)) {
             throw new IllegalStateException("bindPipeline(graphics): pipeline's render pass does not match the active render pass.");
         }
 

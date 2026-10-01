@@ -242,9 +242,24 @@ public class RenderHandlerManager {
         return SuperResolutionConfig.isEnableUpscale() ? SuperResolutionConfig.getRenderScaleFactor() : 1;
     }
 
-    // 某些算法的最小输入尺寸为32x32（比如DLSS），但Minecraft几乎不会小于这个尺寸
-    // 当然，除了Windows上最小化窗口时😅，所以这里直接写死32
-    // fuck Windows & Microsoft
+    /*
+     * ★★ 必须与**光影侧的 `upscaleRatio` 推导**保持一致，而不是与 WindowMixin 的 ceil 一致。
+     *
+     * 光影（Uniform.glsl:100）这样推导渲染尺寸对应的放大比：
+     *     vec2 upscaleRatio = screenSize / floor(SR_RENDER_SCALE_FACTOR * screenSize);
+     * 即光影**隐式认为 render 尺寸 = floor(screen × scale)**（截断！）。
+     * 屏幕高 991、scale 0.5 时 → floor(495.5) = **495**。
+     *
+     * 因此 SR/NSS 侧也必须是 495，否则：
+     *   光影把 MV 乘上 upscaleRatio = (2.0, 2.0020202)
+     *   NSS 却用 _InvInputDims = 1/496 去还原 → **MV 幅度不匹配 → 鬼影**。
+     *
+     * 【历史教训】2026-09-25 一度把这里改成 `Mth.ceil`（想与 WindowMixin 对齐），
+     * 结果 NSS=496、光影=495，鬼影**加剧**。已回滚为截断。
+     * ★ 结论：判断依据是「光影侧的隐式 render 尺寸」，不是「Iris framebuffer 尺寸」。
+     *    Iris 分配 496 高 framebuffer 与光影按 495 计算并不冲突 —— 前者只是多一行
+     *    像素（被 clamp/忽略），而后者才是 MV / jitter 换算的基准。
+     */
     public static int getRenderHeight() {
         return (int) Math.max(getScreenHeight() * getScaleFactor(), 32);
     }
