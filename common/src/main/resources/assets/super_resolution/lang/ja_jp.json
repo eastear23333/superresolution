@@ -305,6 +305,13 @@
     "superresolution.screen.config.hint.frame_generation_only_warning.text": "このシェーダーパックはフレーム生成のみモードを使用しています。超解像度機能は無効です",
     "superresolution.algo.preset.nss.ultra_quality": "ウルトラ品質",
     "superresolution.algo.preset.nss.quality": "品質",
+    "superresolution.algo.nss.briefName": "Arm NSS",
+    "superresolution.algo.preset.nss.balanced": "バランス",
+    "superresolution.screen.config.special.nss.model.name": "Arm NSS モデル",
+    "superresolution.screen.config.special.nss.model.tooltip": "H：最も遅い、最高画質\nM：高速、画質は中〜上（推奨）\nL：最速、画質は中程度",
+    "superresolution.screen.config.special.nss.model.high": "H",
+    "superresolution.screen.config.special.nss.model.mid": "M",
+    "superresolution.screen.config.special.nss.model.low": "L",
     "superresolution.algo.preset.nss.performance": "パフォーマンス",
     "superresolution.algo.preset.nss.ultra_performance": "ウルトラパフォーマンス"
 }

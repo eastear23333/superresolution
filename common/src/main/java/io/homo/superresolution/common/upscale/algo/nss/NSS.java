@@ -132,7 +132,7 @@ public class NSS extends SRApiAlgorithm {
     private int kpnWidth;
     private int kpnHeight;
     /** 生效的模型档位（配置里选了未接入的档位时会回退到 HIGH）。 */
-    private NSSModel model = NSSModel.HIGH;
+    private NSSModel model = NSSModel.MID;
 
     // ─────────────────────────── 推理缓冲 ───────────────────────────
     /** 12ch int8 输入张量，紧凑 NHWC [paddedH][paddedW][12]。 */
@@ -157,11 +157,6 @@ public class NSS extends SRApiAlgorithm {
     private final ITexture[] historyTextures = new ITexture[2];
     /** 本帧写入的下标；读下标恒为 {@code 1 - historyWriteIndex}。 */
     private int historyWriteIndex;
-
-    /** 帧序号，仅用于 {@code dispatchSRApiContext} 开头的诊断日志节流。 */
-    private int diagnosticFrameCounter;
-    /** 帧序号，仅用于 NSS GPU 分段计时日志的节流（每 120 帧一行）。 */
-    private int profilingFrameCounter;
 
     // ─────────────────────────── UBO ───────────────────────────
     private IBuffer preProcessUbo;
@@ -343,25 +338,10 @@ public class NSS extends SRApiAlgorithm {
         return a;
     }
 
-    /**
-     * 读取配置里选择的模型档位。
-     *
-     * <p>UI 已经把未接入的档位置灰，但配置文件可以被手工改，所以这里再兜一层：
-     * 选到未实现的档位时记一条错误日志并回退到 HIGH —— 绝不能用错误的尺寸/权重跑。
-     */
+    /** 读取配置里选择的模型档位（未配置时回退 HIGH）。 */
     private NSSModel resolveSelectedModel() {
         NSSModel selected = SuperResolutionConfig.SPECIAL.NSS.MODEL.get();
-        if (selected == null) {
-            return NSSModel.HIGH;
-        }
-        if (!selected.isImplemented()) {
-            SuperResolution.LOGGER.error(
-                    "NSS 模型档位 {} 尚未接入（缺 0_disocclusion_mask_lq pass / INPUT_LAYOUT=1 定义矩阵 / "
-                            + "native 侧档位驱动的尺寸选择），本次回退到 HIGH。",
-                    selected);
-            return NSSModel.HIGH;
-        }
-        return selected;
+        return selected != null ? selected : NSSModel.MID;
     }
 
     @Override
@@ -693,6 +673,7 @@ public class NSS extends SRApiAlgorithm {
                 // NSS_PREPROCESS_HALF_RES_INPUT 路径）。
                 .addDefine("NSS_INPUT_LAYOUT", halfResLayout ? "1" : "0")
                 // 稳定模式：ClampHistoryToStats 的 theta 上限钳制（压鬼影、保留时序降噪）。
+                // ★ 注意：theta_max 越低 = 抗鬼影越强、但历史权重越低 → **噪点越明显**。
                 .addDefine("NSS_FORCE_HISTORY_CLAMP",
                         SuperResolutionConfig.isNssForceHistoryClamp() ? "1" : "0")
                 .addDefine("NSS_HISTORY_THETA_MAX",
@@ -920,7 +901,6 @@ public class NSS extends SRApiAlgorithm {
         temporalWriteIndex = 0;
         derivativeWriteIndex = 0;
         historyWriteIndex = 0;
-        diagnosticFrameCounter = 0;
     }
 
     private static void destroyComputePipeline(ComputePipeline pipeline) {
@@ -982,19 +962,12 @@ public class NSS extends SRApiAlgorithm {
         } catch (Throwable ignored) {
             // 非 Vulkan 后端 / 不支持时间戳 / 设备未就绪：静默跳过。
         }
-        // CPU 侧计时：与 GPU 时间戳并排，用于区分「真实 GPU 工作」与「GPU 空转等 CPU」。
-        long cpuT0 = System.nanoTime();
         var nativeCmd = commandBuffer.getNativeCommandBuffer();
         // Setup 段：历史清零（仅 reset 帧）+ 三个 UBO 上传，到散射开始为止。
         int nssSetupSlot = (profiler == null || nativeCmd == null)
                 ? -1 : profiler.beginRegion(nativeCmd, PerformanceTracker.VK_NSS_SETUP);
 
         boolean reset = consumeHistoryReset();
-        // 诊断：nss_force_history_reset=true 时每帧都重置历史，用于二分抖动来源。
-        // 抖动消失 → 时序累积链路有问题；抖动依旧 → 单帧链路有问题。
-        if (SuperResolutionConfig.isNssForceHistoryReset()) {
-            reset = true;
-        }
         updateFrameParams(commandBuffer, frameResourcesSet, reset);
 
         /*
@@ -1017,85 +990,13 @@ public class NSS extends SRApiAlgorithm {
         int historyRead = 1 - historyWriteIndex;
         int temporalRead = 1 - temporalWriteIndex;
 
-        // ── 诊断：定位「整体平移式抖动」────────────────────────────
-        // 前 8 帧逐帧打印，之后每 300 帧打一次，避免刷爆日志。
-        if (++diagnosticFrameCounter <= 8 || diagnosticFrameCounter % 300 == 0) {
-            SuperResolution.LOGGER.info(
-                    "NSS 帧诊断 #{}: render={}x{} screen={}x{} padded={}x{}"
-                            + " | jitter=({}, {}) jitterPrev=({}, {})"
-                            + " | mvToPixels=({}, {}) | reset={}"
-                            + " | pingpong deriv r/w={}/{} hist r/w={}/{} temp r/w={}/{}"
-                            + " | exposure={}",
-                    diagnosticFrameCounter,
-                    renderWidth, renderHeight, screenWidth, screenHeight,
-                    paddedWidth, paddedHeight,
-                    params.jitterX, params.jitterY, params.jitterPrevX, params.jitterPrevY,
-                    params.motionToPixelsX, params.motionToPixelsY,
-                    reset,
-                    derivativeRead, derivativeWriteIndex,
-                    historyRead, historyWriteIndex,
-                    temporalRead, temporalWriteIndex,
-                    params.exposure);
-            // 单独一行记录光影侧 jitter 的换算关系：
-            // 光影代码 `taaOffset = SRJitterOffset * (1/viewSize) * 2 * (1,-1)`
-            // 配合 `gl_Position.xy += taaOffset * w`，在 Iris 下 `viewSize` 是
-            // **当前 pass 的 render target 尺寸**（即渲染分辨率），于是几何位移
-            // = SRJitterOffset，正好等于本行的 nssJitter。若两者不等才是异常。
-            float ratioW = renderWidth > 0 ? (float) screenWidth / renderWidth : 1.0f;
-            float ratioH = renderHeight > 0 ? (float) screenHeight / renderHeight : 1.0f;
-            SuperResolution.LOGGER.info(
-                    "NSS 光影 jitter 核对 #{}: scaleCfg={} nssJitter=({}, {})"
-                            + " | viewSizeRatio(screen/render)=({}, {})",
-                    diagnosticFrameCounter,
-                    SuperResolutionConfig.getShaderpackJitterScale(),
-                    params.jitterX, params.jitterY,
-                    ratioW, ratioH);
-        }
-
         ITexture color = frameResourcesSet.vulkan(Color);
         ITexture depth = frameResourcesSet.vulkan(Depth);
         ITexture motion = frameResourcesSet.vulkan(MotionVectors);
 
-        /*
-         * ★★ 尺寸诊断（不是一致性断言，别被这行日志误导）★★
-         *
-         * NSS 内部认为的渲染尺寸 renderWidth/Height 用于推导 _InputDims、native renderSize、
-         * padded / depthScatter 尺寸。这里把它和 Iris 实际分配的输入纹理尺寸对比打印。
-         *
-         * ★★ 注意：两者**本来就可能差 1**，这不算 bug！★★
-         *   - NSS 侧必须是 `(int)` 截断 = floor(screen × scale) —— 唯一依据是**光影**
-         *     （Uniform.glsl:100 `upscaleRatio = screenSize / floor(SR_RENDER_SCALE_FACTOR * screenSize)`），
-         *     光影隐式认为 render = floor(495)。NSS 必须与之一致，否则 MV 幅度失配 → 鬼影。
-         *   - Iris/WindowMixin 侧用 `Mth.ceil` 分配 framebuffer（496 高）。
-         *   - 屏幕高 991、scale 0.5 时 → NSS 认为 495、纹理实际 496，差 1 行是**正常**的
-         *     （多出的那一行被 clamp/texelFetch 边界处理掉）。
-         *
-         * 【历史教训】2026-09-25 曾把 RenderHandlerManager.getRenderHeight() 改成 ceil
-         * 想「消除」这 1 像素差，结果 NSS=496 与光影=495 冲突，**鬼影加剧**，已回滚。
-         *   → 所以本行出现「✗ 不一致 差=0x1」时**不要**去改 getRenderHeight，
-         *     那是设计如此。真正要警惕的是**宽高差大于 1**或**出现负数**。
-         */
-        if (diagnosticFrameCounter <= 8 || diagnosticFrameCounter % 300 == 0) {
-            int texW = color.getWidth();
-            int texH = color.getHeight();
-            boolean consistent = texW == renderWidth && texH == renderHeight;
-            // 允许 1 像素差（见上方注释：floor vs ceil 的固有差异，不是 bug）
-            boolean tolerable = Math.abs(texW - renderWidth) <= 1 && Math.abs(texH - renderHeight) <= 1;
-            SuperResolution.LOGGER.info(
-                    "NSS 尺寸一致性 #{}: 内部认为={}x{} 实际纹理={}x{} -> {}{}",
-                    diagnosticFrameCounter,
-                    renderWidth, renderHeight,
-                    texW, texH,
-                    consistent ? "✓ 完全一致"
-                            : (tolerable ? "△ 差 1 像素（正常，floor vs ceil）"
-                            : "✗ 差异过大（这才是抖动的来源！）"),
-                    consistent ? "" : ("  差=" + (texW - renderWidth) + "x" + (texH - renderHeight)));
-        }
-
         if (nssSetupSlot >= 0) {
             profiler.endRegion(nativeCmd, nssSetupSlot);
         }
-        long cpuSetup = System.nanoTime();
 
         // ── [0] 深度散射初始化（清空）──
         int nssScatterInitSlot = (profiler == null || nativeCmd == null)
@@ -1113,7 +1014,6 @@ public class NSS extends SRApiAlgorithm {
         if (nssScatterInitSlot >= 0) {
             profiler.endRegion(nativeCmd, nssScatterInitSlot);
         }
-        long cpuScatterInit = System.nanoTime();
 
         // ── [2] 深度散射（运动矢量重投影）──
         int nssScatterSlot = (profiler == null || nativeCmd == null)
@@ -1134,7 +1034,6 @@ public class NSS extends SRApiAlgorithm {
         if (nssScatterSlot >= 0) {
             profiler.endRegion(nativeCmd, nssScatterSlot);
         }
-        long cpuScatter = System.nanoTime();
 
         // ── [4.5] MID/LOW：LQ 去遮挡掩码（depth 域）──
         if (disocclusionPipeline != null) {
@@ -1181,7 +1080,6 @@ public class NSS extends SRApiAlgorithm {
         if (nssPreprocessSlot >= 0) {
             profiler.endRegion(nativeCmd, nssPreprocessSlot);
         }
-        long cpuPreprocess = System.nanoTime();
 
         // ── [6] 推理：nss_dp4a ──
         int nssInferenceSlot = (profiler == null || nativeCmd == null)
@@ -1191,7 +1089,6 @@ public class NSS extends SRApiAlgorithm {
         if (nssInferenceSlot >= 0) {
             profiler.endRegion(nativeCmd, nssInferenceSlot);
         }
-        long cpuInference = System.nanoTime();
 
         int nssTemporalSlot = (profiler == null || nativeCmd == null)
                 ? -1 : profiler.beginRegion(nativeCmd, PerformanceTracker.VK_NSS_TEMPORAL);
@@ -1246,40 +1143,6 @@ public class NSS extends SRApiAlgorithm {
 
         if (nssPresentSlot >= 0) {
             profiler.endRegion(nativeCmd, nssPresentSlot);
-        }
-        long cpuPostEnd = System.nanoTime();
-
-        // 分段计时结果：每 120 帧打两行（CPU 侧 + GPU 侧），便于从 latest.log 直接读。
-        if (++profilingFrameCounter % 120 == 0) {
-            long setup = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_SETUP);
-            long sInit = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_SCATTER_INIT);
-            long sScatter = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_SCATTER);
-            long sDisocc = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_DISOCC);
-            long sPre = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_PREPROCESS);
-            long inf = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_INFERENCE);
-            long temporal = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_TEMPORAL);
-            long postproc = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_POSTPROC);
-            long present = PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_NSS_PRESENT);
-            long sum = setup + sInit + sScatter + sDisocc + sPre + inf + temporal + postproc + present;
-            SuperResolution.LOGGER.info(String.format(
-                    "NSS CPU 分段(ms) 合计 %.3f = 装载 %.3f + 散射初始化 %.3f"
-                            + " + 深度散射 %.3f + 前处理 %.3f + 推理 %.3f + 后处理呈现 %.3f",
-                    (cpuPostEnd - cpuT0) / 1e6,
-                    (cpuSetup - cpuT0) / 1e6,
-                    (cpuScatterInit - cpuSetup) / 1e6,
-                    (cpuScatter - cpuScatterInit) / 1e6,
-                    (cpuPreprocess - cpuScatter) / 1e6,
-                    (cpuInference - cpuPreprocess) / 1e6,
-                    (cpuPostEnd - cpuInference) / 1e6));
-            if (sum > 0L) {
-                SuperResolution.LOGGER.info(String.format(
-                        "NSS GPU 分段(ms) 合计 %.3f = 装载 %.3f + 散射初始化 %.3f + 深度散射 %.3f + 遮挡掩码 %.3f + 前处理 %.3f + 推理 %.3f + 时序转换 %.3f + 后处理 %.3f + 呈现 %.3f ｜ 模组 present-blit %.3f / DLSS(上次) %.3f",
-                        sum / 1e6, setup / 1e6, sInit / 1e6, sScatter / 1e6,
-                        sDisocc / 1e6, sPre / 1e6, inf / 1e6,
-                        temporal / 1e6, postproc / 1e6, present / 1e6,
-                        PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_PRESENT_BLIT) / 1e6,
-                        PerformanceTracker.getLastResultGPU(PerformanceTracker.VK_UPSCALE) / 1e6));
-            }
         }
 
         // 帧尾翻转乒乓
@@ -1378,29 +1241,13 @@ public class NSS extends SRApiAlgorithm {
          *             属于重犯第一轮的错误。**除非 shader 的 `+` 被改回 `-`，
          *             否则宿主永远不应该出现负号。**
          *
-         * 【可调倍率】SuperResolutionConfig.nss_motion_vector_scale：
-         *   1.0 = 上面的推导值（默认）；-1.0 = 翻方向（仅用于诊断
-         *   「拖影方向是否相反」）；0 = 关闭重投影（对照用）；
-         *   0.5 / 2.0 = 验证幅度是否差一倍。
          */
-        float mvScale = SuperResolutionConfig.getNssMotionVectorScale();
-        params.motionToPixelsX = renderWidth * mvScale;
-        params.motionToPixelsY = renderHeight * mvScale;
+        params.motionToPixelsX = renderWidth;
+        params.motionToPixelsY = renderHeight;
 
         Vector2f jitter = frameData.jitterOffset();
-        // 诊断开关：对进入 NSS 的 jitter 向量施加符号变换（光影施加几何抖动时
-        // 带 (1,-1) 的 y 翻转，若 NSS 约定未同步该翻转则每帧错位 → 残余抖动）。
-        // 四象限由 nss_jitter_sign_mode 控制（0-3），定位后固化为具体修正。
-        float sgnX = switch (SuperResolutionConfig.getNssJitterSignMode()) {
-            case 2, 3 -> -1.0f;
-            default -> 1.0f;
-        };
-        float sgnY = switch (SuperResolutionConfig.getNssJitterSignMode()) {
-            case 1, 3 -> -1.0f;
-            default -> 1.0f;
-        };
-        params.jitterX = jitter.x * sgnX;
-        params.jitterY = jitter.y * sgnY;
+        params.jitterX = jitter.x;
+        params.jitterY = jitter.y;
         /*
          * ★★ _JitterOffsetTm1 的取值规则（复现官方 ffx_nss.cpp:1146-1160）★★
          *
@@ -1417,15 +1264,12 @@ public class NSS extends SRApiAlgorithm {
          * 在重置后第一帧引入一次错位。
          *
          * 【本实现的历史缺陷】此前只在「首帧」（hasPreviousJitter==false）才镜像，
-         * 运行期 reset（世界加载/传送/_force_history_reset）时仍用上一帧 jitter
-         * → 重置后首帧相位错配。**且 _force_history_reset=true 时每帧都是 reset**，
-         * 于是每帧都在错相位上做重投影 —— 这正好解释了这个开关下的抖动特征。
+         * 运行期 reset（世界加载/传送）时仍用上一帧 jitter → 重置后首帧相位错配。
          */
 
         boolean mirrorJitter = reset || !hasPreviousJitter;
-        // 符号变换同样施加于上一帧 jitter（保持帧间一致性）
-        params.jitterPrevX = (mirrorJitter ? jitter.x : previousJitterX) * sgnX;
-        params.jitterPrevY = (mirrorJitter ? jitter.y : previousJitterY) * sgnY;
+        params.jitterPrevX = mirrorJitter ? jitter.x : previousJitterX;
+        params.jitterPrevY = mirrorJitter ? jitter.y : previousJitterY;
 
         // LUT 常量：IdxModulo/ReducedInputModulo（gcd 约分）+ 静态档的 jitter tile 重映射。
         params.updateLutConstants(false);   // 静态 2x 档：LutOffset 按 jitter 相位计算

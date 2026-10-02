@@ -23,7 +23,7 @@ import net.minecraft.network.chat.Component;
 import java.util.Locale;
 
 /**
- * Arm NSS 的模型档位。
+ * Arm NSS 的模型档位（UI 中显示为 <b>H / M / L</b>，默认 <b>M</b>）。
  *
  * <p><b>这是与「超分比例」完全独立的另一个轴</b>，不要和 {@code QualityPreset} 混淆：
  * <ul>
@@ -38,30 +38,38 @@ import java.util.Locale;
  * （{@code nss-model/scenario/configs/960x540_1920x1080_{high,mid,low}_fragment.json}）：
  *
  * <table border="1">
- *   <caption>三档差异</caption>
- *   <tr><th>档</th><th>DP4A 权重</th><th>预处理输出</th><th>深度散射输出</th>
+ *   <caption>三档差异（成本：H &gt; M &gt; L；质量：H &gt; M &gt; L）</caption>
+ *   <tr><th>档</th><th>特点</th><th>DP4A 权重</th><th>预处理输出</th><th>深度散射输出</th>
  *       <th>KPN 通道</th><th>pre/post build options</th></tr>
- *   <tr><td>HIGH</td><td>high（KPN 6x6）</td><td>= 渲染分辨率</td><td>= 渲染/2</td>
+ *   <tr><td><b>H</b>（HIGH）</td><td>最慢，质量最佳</td><td>high（KPN 6x6）</td>
+ *       <td>= 渲染分辨率</td><td>= 渲染/2</td>
  *       <td>36</td><td>{@code FULL_RES_LUMA_DERIVATIVE=1}, {@code FILTER_MODE=0}</td></tr>
- *   <tr><td>MID</td><td>mid_low（KPN 4x4）</td><td>= 渲染/2</td><td>= 渲染/4</td>
+ *   <tr><td><b>M</b>（MID，默认）</td><td>较快，质量中上</td><td>mid_low（KPN 4x4）</td>
+ *       <td>= 渲染/2</td><td>= 渲染/4</td>
  *       <td>16</td><td>{@code INPUT_LAYOUT=1}, {@code FILTER_MODE=1},
  *       {@code USE_HISTORY_CATMULL=1}</td></tr>
- *   <tr><td>LOW</td><td>mid_low（同上）</td><td>= 渲染/2</td><td>= 渲染/4</td>
- *       <td>16</td><td>同 MID，但 {@code USE_HISTORY_CATMULL=0}</td></tr>
+ *   <tr><td><b>L</b>（LOW）</td><td>最快，质量中等</td><td>mid_low（同上）</td>
+ *       <td>= 渲染/2</td><td>= 渲染/4</td>
+ *       <td>16</td><td>同 M，但 {@code USE_HISTORY_CATMULL=0}</td></tr>
  * </table>
  *
- * <p>注意 MID 与 LOW <b>共用同一份 .vgf 权重</b>，差别只在后处理是否用
+ * <p>注意 M 与 L <b>共用同一份 .vgf 权重</b>，差别只在后处理是否用
  * Catmull-Rom 历史重采样。
+ *
+ * <p><b>H → M/L 的权重转换是官方一等公民路径</b>（2026-10-02 实证）：训练侧
+ * {@code ng-model-gym} 的 {@code prepare_checkpoint_state_dict_for_weights_load}
+ * 内置 KPN 剪枝（6x6 → 4x4，仅此一种转换），只裁 KPN 头两个张量，卷积主干
+ * （两档同构，14 个 CONV2D）权重完整继承。
  */
 public enum NSSModel {
 
-    /** Arm high 档：全分辨率预处理，KPN 6x6 = 36 通道。 */
+    /** <b>H</b>（HIGH）：全分辨率预处理，KPN 6x6 = 36 通道 —— 最慢，质量最佳。 */
     HIGH(0, 1, 36, true),
 
-    /** Arm mid 档：半分辨率预处理 + 去遮挡掩码，KPN 4x4 = 16 通道，历史用 Catmull-Rom。 */
+    /** <b>M</b>（MID）：半分辨率预处理 + 去遮挡掩码，KPN 4x4 = 16 通道，Catmull-Rom 历史 —— 较快，质量中上（默认）。 */
     MID(1, 2, 16, true),
 
-    /** Arm low 档：同 MID 的权重与分辨率，历史不做 Catmull-Rom（更省）。 */
+    /** <b>L</b>（LOW）：同 M 的权重与分辨率，历史不做 Catmull-Rom —— 最快，质量中等。 */
     LOW(1, 2, 16, false);
 
     private final int qualityCode;
@@ -104,23 +112,6 @@ public enum NSSModel {
     /** 预处理是否走半分辨率布局（Arm 的 {@code NSS_INPUT_LAYOUT == 1}）。 */
     public boolean isHalfResolutionInputLayout() {
         return preprocessDownscale != 1;
-    }
-
-    /**
-     * 该档的 Java 侧管线是否已经接好。
-     *
-     * <p>三档均已接入（2026-09-27）：
-     * <ul>
-     *   <li>HIGH：全分辨率预处理 + dense 滤波（FILTER_MODE=0）</li>
-     *   <li>MID：半分辨率预处理（INPUT_LAYOUT=1）+ disocclusion LQ pass
-     *       + sparse 滤波（FILTER_MODE=1）+ Catmull-Rom 历史</li>
-     *   <li>LOW：同 MID，历史不用 Catmull-Rom（USE_HISTORY_CATMULL=0）</li>
-     * </ul>
-     * 非 2x 超分比例仍走 FILTER_MODE=2/3（dynamic LUT），待 offset LUT
-     * 生成管线接入后开放。
-     */
-    public boolean isImplemented() {
-        return true;
     }
 
     /** UI 显示名（本地化）。 */

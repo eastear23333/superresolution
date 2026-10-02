@@ -304,6 +304,13 @@
     "superresolution.screen.config.hint.frame_generation_only_warning.text": "此光影使用僅幀生成模式，超解析度功能已停用",
     "superresolution.algo.preset.nss.ultra_quality": "極致品質",
     "superresolution.algo.preset.nss.quality": "品質",
+    "superresolution.algo.nss.briefName": "Arm NSS",
+    "superresolution.algo.preset.nss.balanced": "平衡",
+    "superresolution.screen.config.special.nss.model.name": "Arm NSS 模型",
+    "superresolution.screen.config.special.nss.model.tooltip": "H：最慢，品質最佳\nM：較快，品質中上（推薦）\nL：最快，品質中等",
+    "superresolution.screen.config.special.nss.model.high": "H",
+    "superresolution.screen.config.special.nss.model.mid": "M",
+    "superresolution.screen.config.special.nss.model.low": "L",
     "superresolution.algo.preset.nss.performance": "效能",
     "superresolution.algo.preset.nss.ultra_performance": "極致效能"
 }

@@ -43,7 +43,7 @@ public class NSSSpecialConfig extends SpecialConfig {
     public EnumValue<NSSModel> MODEL = specBuilder.defineEnum(
             "special/nss/model",
             NSSModel.class,
-            () -> NSSModel.HIGH
+            () -> NSSModel.MID
     );
 
     public NSSSpecialConfig(ModConfigSpecBuilder specBuilder) {
@@ -57,15 +57,13 @@ public class NSSSpecialConfig extends SpecialConfig {
                 new SpecialConfigDescription<NSSModel>()
                         .setKey("model")
                         .setName(Component.translatable("superresolution.screen.config.special.nss.model.name"))
-                        .setTooltip(v -> Optional.of(Component.translatable(v.isImplemented()
-                                ? "superresolution.screen.config.special.nss.model.tooltip"
-                                : "superresolution.screen.config.special.nss.model.tooltip.unimplemented")))
+                        // 三档描述常驻显示（同一 tooltip 内三行），便于横向比较后选择
+                        .setTooltip(v -> Optional.of(Component.translatable(
+                                "superresolution.screen.config.special.nss.model.tooltip")))
                         .setValueNameSupplier(v -> Optional.of(v.getDisplayName()))
                         .setType(ConfigSpecType.ENUM)
                         .setClazz(NSSModel.class)
-                        .setDefaultValue(NSSModel.HIGH)
-                        // 未接入的档位在 UI 中置灰，避免选到会产出错误画面的配置
-                        .setItemEnableRequirement(NSSModel::isImplemented)
+                        .setDefaultValue(NSSModel.MID)
                         .setSaveConsumer((v) -> {
                             if (getSpecialConfigs().NSS.MODEL.get() != v) {
                                 getSpecialConfigs().NSS.MODEL.set(v);

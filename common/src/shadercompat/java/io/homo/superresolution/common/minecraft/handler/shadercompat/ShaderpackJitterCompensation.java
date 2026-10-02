@@ -18,37 +18,50 @@
 
 package io.homo.superresolution.common.minecraft.handler.shadercompat;
 
-import io.homo.superresolution.common.config.SuperResolutionConfig;
 import io.homo.superresolution.common.minecraft.handler.RenderHandlerManager;
 import org.joml.Vector2f;
 
 /**
  * 光影侧 {@code SRJitterOffset} 的幅度补偿。
  *
- * <h2>问题</h2>
+ * <h2>背景</h2>
  * 光影（以 Sundial 系为代表）把 TAA jitter 交给 SR 提供，写法是：
  * <pre>
  *   shaders.properties          uniform.vec2.texelSize = vec2(1.0 / viewWidth, 1.0 / viewHeight)
  *   libs/Uniform.glsl           vec2 taaOffset = SRJitterOffset * texelSize * 2.0 * vec2(1.0, -1.0);
  *   programs/gbuffers/*.vert    gl_Position.xy += taaOffset * gl_Position.w;
  * </pre>
- * 其中 {@code viewWidth}/{@code viewHeight} 是**物理屏幕**尺寸，而几何实际渲染到的是
- * **渲染目标**（超分前的低分辨率）。把 {@code taaOffset} 从 NDC 折算回「渲染分辨率像素」：
- * <pre>
- *   taaOffset_ndc * renderSize / 2
- *     = SRJitterOffset * (1 / screenSize) * 2 * renderSize / 2
- *     = SRJitterOffset * renderSize / screenSize
- * </pre>
- * 也就是说，SR 若按 FSR2 标准（±0.5 渲染像素）原样注入 {@code SRJitterOffset}，
- * 光影实际只施加了 {@code renderSize / screenSize} 倍的偏移（2x 超分时为 0.5 倍）。
- * 而算法侧（如 NSS 的 {@code _JitterOffset}）仍按完整 ±0.5 像素做去抖与重投影，
- * 两者不自洽 → 相机静止时画面整体缓慢平移，运动时抖动。
  *
- * <h2>修复</h2>
- * 注入光影前把 jitter 乘以 {@code screenSize / renderSize}，使光影实际施加的
- * 渲染像素位移与算法侧收到的 {@code _JitterOffset} 完全一致。
+ * <h2>结论：默认不补偿</h2>
+ * 实证（2026-09-25，曾注入补偿，抖动反而加剧，已回退）：Iris 的
+ * {@code viewWidth}/{@code viewHeight} 是<b>当前 pass 的 render target 尺寸</b>
+ * （见 irisapi NewCompositeRenderer：{@code pass.viewWidth = passWidth = target.getWidth()}），
+ * 在 SR 环境下即<b>渲染分辨率</b>，而非物理窗口尺寸。于是：
+ * <pre>
+ *   taaOffset_ndc      = SRJitterOffset * (1 / renderSize) * 2
+ *   几何位移(渲染像素) = taaOffset_ndc * renderSize / 2 = SRJitterOffset
+ * </pre>
+ * 即光影实际施加的位移<b>本来就等于</b>算法侧收到的 {@code _JitterOffset}，无需任何补偿
+ * （{@link #SHADERPACK_JITTER_SCALE} = 0.0）。
+ *
+ * <p>补偿分支保留，供将来排查其它光影变体（例如某个光影确实按物理窗口尺寸计算
+ * {@code texelSize} 的情况）。
  */
 public final class ShaderpackJitterCompensation {
+
+    /**
+     * 光影侧 jitter 的补偿倍率。
+     *
+     * <p>原为 config 旋钮 {@code shaderpack_jitter_scale}，已按默认行为固化为常量。
+     * 取值语义：
+     * <ul>
+     *   <li>{@code 0.0} = 不补偿（默认，实证正确的行为，见类注释）</li>
+     *   <li>{@code 1.0} = 按 {@code screenSize / renderSize} 补偿</li>
+     *   <li>{@code -1.0} = 按比例补偿且取反</li>
+     *   <li>其它值 = 直接作为固定倍率</li>
+     * </ul>
+     */
+    private static final float SHADERPACK_JITTER_SCALE = 0.0f;
 
     private ShaderpackJitterCompensation() {
     }
@@ -56,17 +69,17 @@ public final class ShaderpackJitterCompensation {
     /**
      * 对即将注入光影的 jitter 做幅度补偿。
      *
-     * <p>注意：实证表明 Iris 的 {@code viewWidth} 是当前 pass 的 render target 尺寸，
-     * 光影本来就会施加正确幅度的 jitter，因此默认配置 {@code 0.0}（不补偿）即为正确行为。
+     * <p>当前倍率为 {@code 0.0}（不补偿）：Iris 的 {@code viewWidth} 是当前 pass 的
+     * render target 尺寸，光影本来就会施加正确幅度的 jitter（推导见类注释）。
      *
      * @param rawJitter 原始 jitter（渲染分辨率像素，FSR2 halton，±0.5）
-     * @return 补偿后的 jitter
+     * @return 补偿后的 jitter；{@code null} 时返回 {@code null}
      */
     public static Vector2f compensate(Vector2f rawJitter) {
         if (rawJitter == null) {
             return null;
         }
-        float scale = SuperResolutionConfig.getShaderpackJitterScale();
+        float scale = SHADERPACK_JITTER_SCALE;
 
         // 0.0：不补偿（默认，正确行为）。
         if (scale == 0.0f) {

@@ -39,6 +39,16 @@ public class AlgorithmManager {
     public static AlgorithmParam param = new AlgorithmParam();
 
     /**
+     * 稳定模式：KPN 输入链修复前禁用 jitter。
+     *
+     * <p>原为 config 旋钮 {@code nss_disable_jitter}（默认开启），已按当前默认行为固化为常量。
+     * jitter 是光影 {@code SRJitterOffset} 与 NSS {@code _JitterOffset} 的共同源头，
+     * 返回 0 即全链生效。实测：jitter=0 时静止画面完全稳定；jitter 存在（任意符号）
+     * 则输出微抖，与 NSS 内部处理方式无关。待 KPN 输入链修复后改为 {@code false} 恢复抖动。
+     */
+    private static final boolean STABLE_MODE_DISABLE_JITTER = true;
+
+    /**
      * @deprecated MotionVectorsGenerator 已被弃用
      */
     @Deprecated
@@ -155,11 +165,8 @@ public class AlgorithmManager {
     }
 
     public static Vector2f getJitterOffset() {
-        // 稳定模式（2026-09-27）：KPN 输入链修复前禁用 jitter —— 本函数是
-        // 光影 SRJitterOffset 与 NSS _JitterOffset 的共同源头，返回 0 即全链生效。
-        // 实测：jitter=0 时静止画面完全稳定；jitter 存在（任意符号）则输出微抖，
-        // 与 NSS 内部处理方式无关（详见 config 注释与当日工作记忆）。
-        if (SuperResolutionConfig.isNssDisableJitter()) {
+        // 稳定模式：KPN 输入链修复前禁用 jitter，详见 STABLE_MODE_DISABLE_JITTER 的说明。
+        if (STABLE_MODE_DISABLE_JITTER) {
             return new Vector2f(0);
         }
         if (supportsJitter(SuperResolution.algorithmDescription)) {
